@@ -251,6 +251,17 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       file), so the encoder and the decoder really do agree - the decoder
       is reproducible and the token stream really is a permutation of the
       literals.
+      The chain of consequences (this is the whole bug in one paragraph):
+      the literal's 8 bits are decoded from the stream, but with a
+      probability that is slightly wrong (the prepare pass has not
+      adapted the two deepest nodes of the current byte's tree), so the
+      range coder's code/range state ends up slightly different - and
+      therefore the NEXT symbol (the run length) is decoded from the
+      wrong position and comes out as 0 instead of 5 or 1, and the symbol
+      after that is off as well.  That is why the run symbol looks broken
+      in the tiny cases: it is a symptom, not the cause.  The only real
+      defect is that lit[80] and lit[160] (the 7th and 8th bit's nodes)
+      are not prepared.
       Decoding the first literal of the 6 byte case with a CONSTANT model
       (all the probabilities 2048) gives 0x42 and never 0x41, no matter how
       the range decoder is initialised (48 variants of the skip/code/
