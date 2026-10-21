@@ -232,16 +232,35 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       and tiny\ab1000.dgc / tiny\abc1000.dgc are the 4 and 5 byte
       variants (their token streams must be permutations of "ABAB" and
       "ABCAB").
-      A PERFECT, TINY, INDEPENDENT ORACLE: the name list.  The IFNM block
-      of dgca_v100e.dgc is 117 bytes and the tool's own listing
-      ("dgcac l <archive>") prints the names, so the name list's plaintext
-      can be rebuilt exactly (u32 length + the name, per entry) - the
-      rebuilt blob is 117 bytes, which matches the block's original size
-      exactly, so the reconstruction is proven.  The block's token stream
-      must be a permutation of those 117 bytes, which is a pass/fail test
-      in about a millisecond.  (The index block of 512 bytes is a second,
-      weaker oracle: most of an index entry is zeros and the CRCs of the
-      stored files are not known.)
+      ORACLES (all exact, all independent of the CM decoder):
+      * The 117 byte name list of dgca_v100e.dgc: the tool's own listing
+        prints the names, so the name list's plaintext can be rebuilt
+        exactly (u32 length + the name, per entry).  The rebuilt blob is
+        117 bytes, matching the block's original size exactly, so the
+        reconstruction is proven.  Its token stream must be a permutation
+        of those 117 bytes: a pass/fail test in about a millisecond.
+      * The 795042 byte name list of names.dgc: the same trick, but the
+        names have to be taken from the FILESYSTEM (the tool's listing is
+        lossy in both the default and the -u mode, because the console
+        code page cannot represent the Japanese names).  Extracting the
+        archive with "dgcac e" and reading the file names as raw bytes
+        reproduces the name list exactly: 795042 bytes, difference 0.  The
+        block's model stream gives 754623 literals and 472 matches, which
+        matches v7 exactly, so the literal positions are known and the
+        literals themselves can be computed - the strongest oracle yet
+        (any single wrong symbol destroys the histogram).
+      * The chain walk also pins the ORDER: the token stream is the
+        literals reordered by the chain, i.e. the values grouped
+        ascending, the group containing the start index first, the
+        within-group order the original one.  The start index is the
+        block's v22 (a candidate, not confirmed).
+      * What is left is not a parameter: with the 117 byte oracle, 73728
+        combinations (initial model values, prepare/restore chain,
+        direction, scale chain, initial previous byte) and 96 range
+        decoder initialisations were tried, and no variant gets past 44 of
+        117.  Forcing each of the 256 possible first literals also fails
+        (the best is 31 of 117), so the model update itself - not just the
+        first bit - is wrong.
       More real world samples: the SFX stripped archives in the work area
       root, dgca_beta1.dgc and dgca_v100e.dgc, contain blocks from 117
       bytes up to 839680 bytes (up to 773298 literals and a 410631 byte CM
