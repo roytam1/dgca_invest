@@ -116,27 +116,23 @@ decoder side: `stream A -> entropy -> LZ inverse -> pre-transform inverse`.
     renormalise `code = ((code<<1)|(prev&1))<<7 | (b>>1); range <<= 8`.
   * *Proof*: re-encoding the pre-transform model stream of a real archive reproduces the
     real bytes exactly (`003000fbd8800000` for 4096x`A`).
-* **Symbol coding** - gamma style: the number of "small branch" decisions = the value's bit
-  length, then `len-1` raw bits (MSB first). 32-entry, 12-bit probability models initialised
-  to 2048. The encoder writes `len-1` raw bits, not `len` - an off by one here
-  desynchronises everything after the first symbol.
-* **Context-mixing literal coder** - order-1 (`lit[256]`) + order-2 (`pair[65536]`) models
-  mixed against a 32-slot context table; the slot is `BSR(state)` and is **31 when the state
-  is 0** (the encoder pre-loads `eax = 1Fh` before `bsr`). The literal is coded MSB first
-  over a 9-bit tree: `node = 2*node + bit` (node starts at 1) and
-  `value = 2*value + bit`, i.e. the first bit is the most significant.
-  Two traps here, both found the hard way:
-  * the **prepare** pass (which pre-computes the order-1 model updates for the 8 context
-    nodes) uses a scale chain of `0x2000, node0, node1, ...` - the scale for level *k* is
-    the **node** of level *k-1*, not the value computed at level *k-1* (the encoder does
-    `mov ecx, eax` at the end of every prepare level, clobbering the scale register);
-  * the prepare pass walks the context chain from the **raw** previous byte, while the
-    restore pass starts at `prev|0x100`, so the two passes touch different nodes.
-  Getting either wrong desynchronises the models after the *first* literal, so a
-  single-literal block still decodes correctly while longer ones do not.
-  *Proof*: re-encoding the literal/run stream of a real archive reproduces the archive's
-  bytes exactly (`004120000000` for the 4096x`A` sample), which validates the range
-  coder, this coder and the gamma symbol coder together.
+* **Symbol coding** (gamma) - verified line by line against `sub_427880` (encoder) and
+  `sub_4271B0` (decoder): the number of "small branch" decisions = the value's bit length,
+  then `len-1` raw bits (MSB first). 32-entry, 12-bit probability models initialised to 2048.
+* **CM literal coder** - order-1 (`lit[256]`) + order-2 (`pair[256*256]`) models mixed against a
+  32-slot context table; the slot is `BSR(state)` and is **31 when the state is 0** (the encoder
+  pre-loads `eax = 1Fh` before `bsr`). The literal is coded MSB first over a 9-bit tree:
+  `node = 2*node + bit` (node starts at 1) and `value = 2*value + bit`, i.e. the first bit is the
+  most significant.
+  * the **prepare** pass: 8 levels, `node = chain>>1`, `chain = node`, and the *scale* of level
+    k is the **node** of level k-1 (the encoder clobbers the scale register with
+    `mov ecx, eax`); the first scale is `0x2000`.
+  * the **restore** pass: same chain, `lit[node] = saved +/- (saved>>p_lit)` and
+    `pair[cur*256+node] +/- (>>p_pairb)`.
+  * the **pair** index is `prev*256+node`, the **run** index is `cur*32+value`.
+  * *Open*: the chain of the prepare/restore passes. The encoder passes the **previous byte**
+    (`arg_24`), the decoder passes the object field `this[0x24]` which is read **once per block**
+    (so it is constant). Neither reading reproduces every archive yet.
 * **Pre-transform** - LZ77 with an *implicit distance*: a 2-byte hash table maps
   `(prev byte, byte) -> last output position`; the distance is never transmitted, the
   decoder rebuilds the same table. `minmatch = 1 << this[14]`. Stream B carries
@@ -144,27 +140,24 @@ decoder side: `stream A -> entropy -> LZ inverse -> pre-transform inverse`.
 * **Block header** - `size` = the *original* size, `v7` = the size fed to the entropy coder
   (= the size of the pre-transform's output, the literal bytes). (Easy to mix up; `v7` is
   what the decoder must produce from stream A.)
+* **Pipeline order** (from the disassembly of `sub_425600` / `sub_425A50`):
+  encode = `[LZ stage] -> [pre-transform] -> [entropy]`, decode =
+  `[entropy] -> [chain walk] -> [inverse pre-transform]`.
+* **Chain walk** (`sub_428990`, fully known): histogram -> prefix sums ->
+  `Block[cnt[src[i]]++] = i` -> `dest[k] = src[Block^k(start)]`; the start index is
+  `*(u32*)arg_C` (arg_C is a *pointer*).
 
 **Still open:**
 
 * **The LZ stage** (`sub_428270` / `sub_428990`) - the last blocker for reading the index
-  of a compressed archive. The stage is size preserving: the entropy stream decodes to
-  exactly `v7` bytes, which is also the size of the pre-transform's output. It is *not* a
-  plain permutation though: the histogram of the decoded bytes differs from the histogram
-  of the pre-transform's output, so the stage transforms the values as well (it reorders by
-  2-byte context and applies a delta/order transform; the encoder contains a chi-square
-  analysis that picks the delta order, and the "column" variant is method A). The decoder
-  side rebuilds a permutation table from the byte histogram and walks a chain:
-  `Block[cnt[src[i]]++] = i`, `dest[k] = src[Block^k(start)]`. That chain preserves the
-  byte multiset, so it cannot invert a delta transform - one of the two readings is still
-  wrong. The open items are the exact role of the chain (which buffer it consumes) and the
-  start index (the block header's +0x10, "v22", is a candidate).
-  The encoder side (`sub_428270`, ~440 lines of decompiled C with chi-square analysis) is
-  the place to look next; the `v96[]` array it fills is the permutation.
-* **The CM literal coder still diverges on the last symbol or two** of a multi-literal
-  stream. With the scale fix the decoded length is now correct and re-encoding the decoded
-  bytes reproduces the archive's stream to within the last two bytes (25/27 and 33/35 on the
-  two test archives), so the remaining model difference is at the very end of the stream.
+  of a compressed archive. The stage is size preserving and groups equal byte values
+  together, but it also changes the values (a delta/order transform; the encoder contains
+  a chi-square analysis that picks the delta order, and the "column" variant is method A).
+  The open items are the exact role of the chain (which buffer it consumes - the literals
+  or the original data; the sizes only agree for the literals) and the start index.
+* **The CM literal coder's chain** - see above; no variant reproduces all 11 test blocks
+  yet (the best get 3 of 11 byte exact; the index blocks behave much better than the
+  data blocks, which points at the run symbol or the LZ stage).
 * **Solid mode "column" method** (method A) - flags bit 2, delta order in bits 16..31.
   Sizes come out right, content is wrong.
 * **Encryption** (`-p` / `-k`) is fully specified in `NOTES-dgca-format.md` section 8 (the
@@ -230,6 +223,12 @@ Static reading of this binary is slow and error-prone; the following loop is far
 5. **Turn the encoder into an oracle.** Once the *encoder* reproduces a real stream
    byte-for-byte, `encode(decode(real_stream)) == real_stream` becomes a cheap
    pass/fail test for the decoder, and the first differing byte localises the divergence.
+   This is the sharpest tool available for the CM coder: the best test archives are the
+   ones with the longest stream A - `t1000.bin.dgc` DATA (269 bytes), `m_700.dgc` DATA
+   (269), `m_300_300.dgc` DATA (250), `m_100_200_300.dgc` DATA (245) and the IFDT
+   blocks of the same archives (65..76 bytes). The scratch scripts are `pdec.py`
+   (the parameterised CM decoder), `bf5.py` (the matching encoder), `joint2.py` (the
+   joint variant search) and `chain4.py` (the chain matrix).
 
 Three bugs that cost real time and are worth remembering:
 
