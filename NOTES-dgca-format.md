@@ -262,6 +262,21 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       160, 80, 40, ...), and a decoder cannot know the current byte
       before it has read the model - which is the contradiction to
       resolve.
+      The exact contradiction, in one paragraph:
+        - the prepare+restore pair is the model update of the byte whose
+          tree path it walks (the direction is that byte's bit at each
+          level, the magnitude is scaled by the node of the previous
+          level), and the main loop reads the model with that update
+          already applied;
+        - the tool's decoder must reproduce it, and the only way it can
+          know the direction of the update for the node it is about to
+          read is to have already decoded that bit - so the update must be
+          applied one step later than the encoder applies it, or the
+          encoder's main loop must read the *unprepared* model;
+        - the scale chain makes the two orders differ: the encoder
+          prepares from the deepest node up (so the scale of a level is
+          the node of the level below it), while a decoder working from
+          the root down would have to use the node of the level above it.
       Two variants each nail ONE of the cases exactly, so the truth is
       close to both but is not in the searched space (4608 combinations of
       the prepare/restore direction, the scale chain, the chain byte, the
