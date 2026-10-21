@@ -246,6 +246,21 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       => the run symbol's model is off by the same kind of error as the
       literal model, so the bug is in the shared model update (the
       prepare/restore passes), not in the literal coder alone.
+      Two variants each nail ONE of the cases exactly, so the truth is
+      close to both but is not in the searched space (4608 combinations of
+      the prepare/restore direction, the scale chain, the chain byte, the
+      pair/run model bases, the value assembly and the initial previous
+      byte were searched - none of them satisfies more than one case):
+        twoblk : the scale chain "0x2000, node0*128, node1*128, ..." with
+                 the initial previous byte 0xFF decodes it exactly.
+        ab1000 : the prepare's direction flipped (the same as the
+                 restore's) with the disassembly's scale chain and the
+                 initial previous byte 0 decodes it exactly ("BBAA").
+      The differences between the two are the multiplier of the scale
+      chain (1 vs 128), the prepare's direction (flipped vs not) and the
+      initial previous byte (0 vs 0xFF) - all three are needed for one
+      case and wrong for the other, so one of the three assumptions is
+      still off.
 
       The argument lists of the two functions are NOT the same, and mixing
       them up was the cause of a whole afternoon of confusion:
