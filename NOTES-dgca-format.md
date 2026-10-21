@@ -232,6 +232,20 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       and tiny\ab1000.dgc / tiny\abc1000.dgc are the 4 and 5 byte
       variants (their token streams must be permutations of "ABAB" and
       "ABCAB").
+      What the three cases show (the token stream must be a permutation
+      of the literals, the LZ stage being a pure permutation):
+        twoblk  : the token stream is "AAAAAA" = ONE symbol (the literal
+                  'A' with a run of 5) - the mult=128 variant decodes it
+                  exactly.
+        ab1000  : the token stream is a permutation of "ABAB", e.g.
+                  "BBAA" = TWO symbols ('B' with a run of 1 and 'A' with
+                  a run of 1).  The decoder produces four symbols with
+                  the runs 0,0,0,0 - the first two literals are right
+                  ('B','B') but the run symbol comes out as 0 where it
+                  must be 1.
+      => the run symbol's model is off by the same kind of error as the
+      literal model, so the bug is in the shared model update (the
+      prepare/restore passes), not in the literal coder alone.
 
       The argument lists of the two functions are NOT the same, and mixing
       them up was the cause of a whole afternoon of confusion:
