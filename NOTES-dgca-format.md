@@ -143,8 +143,9 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       state: low/code, range, pending byte, pending 0xFF count.
       encoder: low=0, range=0x80000000; emits low>>23, keeps 23 bits,
                carry handled by a pending 0xFF counter; flush = 5 bytes.
-      decoder: SKIP ONE BYTE (the encoder's dummy byte), then
-               code = b>>1, range = 0x80; renormalise:
+      decoder: SKIP ONE BYTE (the encoder's dummy byte - sub_4270A0
+               does `inc edx; mov [eax+10h], edx` before it reads the
+               code), then code = b>>1, range = 0x80; renormalise:
                  code = ((code<<1)|(prev&1))<<7 | (b>>1); range <<= 8
       VERIFIED byte exact (encoder reproduces real stream B bytes).
 
@@ -202,22 +203,31 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
 
       OPEN - which byte the chain of the prepare/restore passes walks.
       The encoder passes the previous byte (arg_24 = var_484C6) and the
-      decoder passes ... the object field this[0x24] (arg_20) which the
-      disassembly says is p_ctx - a constant per block.  A 6 byte test
-      case (a 1000 byte file "A"*500 + "B"*500, whose token stream must be
-      "AAAAAA" because the pre-transform's model says so) shows that the
-      chain must contain the node 80 = (0x141)>>2, i.e. the chain is
-      0x141 = 0x41|0x100 - the CURRENT byte, not the previous one:
-      the first literal decodes as 0x42 instead of 0x41 and the 7th bit
-      is the first one that differs, and the probability of that bit can
-      only differ from 2048 if lit[80] was touched by the prepare pass.
-      So the prepare/restore chain is the current byte's chain (its nodes
-      are exactly the 8 nodes the main loop reads, in reverse order).
-      That is impossible for a decoder that has to read the model before
-      it knows the byte, so either the main loop must read the UNPREPARED
-      model (the prepare is a deferred update) or the decoder has to apply
-      the prepare's effect incrementally while it decodes the bits.
-      This is the last known gap in the CM coder.
+      decoder passes the object field this[0x24] (arg_20) which the
+      disassembly says is p_ctx - a constant per block.
+      A 6 byte test case pins it down: a 1000 byte file "A"*500 + "B"*500
+      is stored as a 6 byte token stream, and the pre-transform's model
+      stream (reproduced byte for byte) says that the token stream must be
+      a permutation of the literals "AAAAAA".  The decoder produces
+      0x42,0x52,0x52,0x0c,0xc0,0xc0: the first 6 bits of the first
+      literal are right (010000 = the prefix of 0x41) and the 7th bit -
+      the node 80 = (0x141)>>2, i.e. the current byte's chain - is the
+      first wrong one.  The probability of that bit can only differ from
+      2048 if lit[80] was touched by the prepare pass, and the prepare
+      pass can only touch it if the chain is the CURRENT byte
+      (0x41|0x100 = 0x141, whose nodes are 160, 80, 40, 20, 10, 5, 2, 1
+      - exactly the 8 nodes the main loop reads).  The decoder cannot
+      know the current byte before it has read the model, so either the
+      main loop must read the *unprepared* model, or the decoder has to
+      apply the prepare's effect while it decodes the bits.
+      Making the prepare's update 128 times bigger (i.e. the scale chain
+      "0x2000, node0*128, node1*128, ...") reproduces the 6 byte case
+      exactly but breaks the other cases, so it is a compensation for a
+      still unknown bug, not the truth.
+      The 6 byte case is the ideal regression test: it is in
+      tiny\twoblk.dgc (with tiny\twoblk.bin and tiny\twoblk.n.dgc), and
+      tiny\ab1000.dgc / tiny\abc1000.dgc are the 4 and 5 byte variants
+      (their token streams must be permutations of "ABAB" and "ABCAB").
 
       The argument lists of the two functions are NOT the same, and mixing
       them up was the cause of a whole afternoon of confusion:
@@ -274,18 +284,23 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       together - and indeed the decoded token stream has its values
       clustered (the 6955 bytes of the dgca100 DATA block decode into only
       1449 (literal,run) symbols, i.e. the equal values are adjacent).
-      The encoder side (sub_428270) confirms this: it builds an index
-      array (a permutation) and the output bytes are copied from the source
-      unchanged - so the LZ stage is a pure reordering and the token stream
-      has exactly the same byte histogram as the pre-transform's literals.
-      (The earlier assumption that the stage also applies a delta was
-      wrong; the chi-square analysis of sub_4244E0 is a separate look
-      ahead that the encoder calls AFTER the LZ stage.)
-      What is still unexplained: the decoded token stream's histogram does
-      NOT match the literals' histogram, so the entropy decoder still
-      produces wrong bytes (the re-encode test cannot see that, see 6g).
-      The open items: the exact start index of the chain walk and the bug in
-      the entropy decoder.
+      The encoder side (sub_428270) builds an index array (a permutation)
+      and copies the bytes unchanged: out[j] = src[index[j]-1] (with a
+      wrap around for index 0).  So the LZ stage itself is a pure
+      reordering - but the token stream is NOT a permutation of the
+      pre-transform's literals:
+        a 1000 byte file "A"*500 + "B"*500 is stored as a 6 byte token
+        stream whose first literal decodes as 0x42 while the pre-
+        transform's literals are "AAAAAA" (0x41 x 6) - and the pre-
+        transform's model stream is reproduced byte for byte, so the
+        literals are known exactly.  0x42 is not even one of the literal
+        values, so the stage (or something else on the way) transforms the
+        values.  Neither the chain walk (a permutation) nor the inverse
+        pre-transform (a plain LZ77 with the implicit distance, no
+        accumulator) inverts such a transform, so the value transform (and
+        its inverse) is still unknown.
+      The open items: the exact start index of the chain walk, the value
+      transform and where it is inverted.
       This is what still blocks reading the index of a compressed archive.
 
   6f. Solid mode uses the "column" method (flags bit 2 set, delta order in
