@@ -117,12 +117,26 @@ decoder side: `stream A -> entropy -> LZ inverse -> pre-transform inverse`.
   * *Proof*: re-encoding the pre-transform model stream of a real archive reproduces the
     real bytes exactly (`003000fbd8800000` for 4096x`A`).
 * **Symbol coding** - gamma style: the number of "small branch" decisions = the value's bit
-  length, then `len-1` raw bits. 32-entry, 12-bit probability models initialised to 2048.
+  length, then `len-1` raw bits (MSB first). 32-entry, 12-bit probability models initialised
+  to 2048. The encoder writes `len-1` raw bits, not `len` - an off by one here
+  desynchronises everything after the first symbol.
 * **Context-mixing literal coder** - order-1 (`lit[256]`) + order-2 (`pair[65536]`) models
   mixed against a 32-slot context table; the slot is `BSR(state)` and is **31 when the state
   is 0** (the encoder pre-loads `eax = 1Fh` before `bsr`). The literal is coded MSB first
   over a 9-bit tree: `node = 2*node + bit` (node starts at 1) and
   `value = 2*value + bit`, i.e. the first bit is the most significant.
+  Two traps here, both found the hard way:
+  * the **prepare** pass (which pre-computes the order-1 model updates for the 8 context
+    nodes) uses a scale chain of `0x2000, node0, node1, ...` - the scale for level *k* is
+    the **node** of level *k-1*, not the value computed at level *k-1* (the encoder does
+    `mov ecx, eax` at the end of every prepare level, clobbering the scale register);
+  * the prepare pass walks the context chain from the **raw** previous byte, while the
+    restore pass starts at `prev|0x100`, so the two passes touch different nodes.
+  Getting either wrong desynchronises the models after the *first* literal, so a
+  single-literal block still decodes correctly while longer ones do not.
+  *Proof*: re-encoding the literal/run stream of a real archive reproduces the archive's
+  bytes exactly (`004120000000` for the 4096x`A` sample), which validates the range
+  coder, this coder and the gamma symbol coder together.
 * **Pre-transform** - LZ77 with an *implicit distance*: a 2-byte hash table maps
   `(prev byte, byte) -> last output position`; the distance is never transmitted, the
   decoder rebuilds the same table. `minmatch = 1 << this[14]`. Stream B carries
@@ -133,25 +147,24 @@ decoder side: `stream A -> entropy -> LZ inverse -> pre-transform inverse`.
 
 **Still open:**
 
-* **LZ stage permutation** (`sub_428270` / `sub_428990`). The stage is size preserving:
-  the entropy stream decodes to exactly `v7` bytes, which is also the size of the
-  pre-transform's output. It is *not* a plain permutation though: the histogram of the
-  decoded bytes differs from the histogram of the input, so the stage transforms the values
-  as well (it reorders by 2-byte context and applies a delta/order transform; the encoder
-  contains a chi-square analysis that picks the delta order, and the "column" variant is
-  method A). The decoder side rebuilds a permutation table from the byte histogram and
-  walks a chain: `Block[cnt[src[i]]++] = i`, `dest[k] = src[Block^k(start)]`. This is
-  implemented but does **not** yet reproduce the original order.
-  Consequence: the *index* of a compressed archive still decodes to garbage, so the tool
-  can list/extract stored archives but not read the index of compressed ones.
+* **The LZ stage** (`sub_428270` / `sub_428990`) - the last blocker for reading the index
+  of a compressed archive. The stage is size preserving: the entropy stream decodes to
+  exactly `v7` bytes, which is also the size of the pre-transform's output. It is *not* a
+  plain permutation though: the histogram of the decoded bytes differs from the histogram
+  of the pre-transform's output, so the stage transforms the values as well (it reorders by
+  2-byte context and applies a delta/order transform; the encoder contains a chi-square
+  analysis that picks the delta order, and the "column" variant is method A). The decoder
+  side rebuilds a permutation table from the byte histogram and walks a chain:
+  `Block[cnt[src[i]]++] = i`, `dest[k] = src[Block^k(start)]`. That chain preserves the
+  byte multiset, so it cannot invert a delta transform - one of the two readings is still
+  wrong. The open items are the exact role of the chain (which buffer it consumes) and the
+  start index (the block header's +0x10, "v22", is a candidate).
   The encoder side (`sub_428270`, ~440 lines of decompiled C with chi-square analysis) is
   the place to look next; the `v96[]` array it fills is the permutation.
-* **The CM literal coder diverges on multi-literal data.** The range coder, the gamma symbol
-  coder and the pre-transform are all byte-exact verified; the context-mixing literal coder
-  is right for a single literal but its model updates over a longer run are still off (an
-  archive of 390 bytes of text decodes to the right length but the wrong bytes). Start from
-  the "prepare" / "restore" passes over the order-1 model and the `pair[256*prev + node]`
-  indexing.
+* **The CM literal coder still diverges on the last symbol or two** of a multi-literal
+  stream. With the scale fix the decoded length is now correct and re-encoding the decoded
+  bytes reproduces the archive's stream to within the last two bytes (25/27 and 33/35 on the
+  two test archives), so the remaining model difference is at the very end of the stream.
 * **Solid mode "column" method** (method A) - flags bit 2, delta order in bits 16..31.
   Sizes come out right, content is wrong.
 * **Encryption** (`-p` / `-k`) is fully specified in `NOTES-dgca-format.md` section 8 (the
@@ -174,6 +187,8 @@ cmd /c '"C:\Program Files (x86)\Microsoft Visual Studio\VC98\Bin\VCVARS32.BAT" >
 ```
 
 `cl` does not run the link step here - run `link` explicitly, or the `.exe` is not produced.
+(The workarea is a UNC path, which `cmd` cannot `cd` to; build in a local directory and
+copy the `.exe` back, or map a drive letter first.)
 
 ```powershell
 dgcunp.exe -v archive.dgc            # dump the chunk tree + CRC status
@@ -192,7 +207,7 @@ Current state of `dgcunp.c`:
 | `IARC`, `IFDT` (stored form), `IFNM` | working |
 | extract, stored archives | working - files byte-identical to the originals |
 | compressed data, each-file mode | working - decoded data area CRC matches the archive |
-| compressed index | blocked on the LZ-stage permutation (section 4) |
+| compressed index | blocked on the LZ stage (section 4) |
 | solid mode | sizes right, content wrong |
 | encrypted archives | not implemented |
 
@@ -212,14 +227,19 @@ Static reading of this binary is slow and error-prone; the following loop is far
    single match validated the range coder, the symbol coder and the pre-transform at once.
 4. **Use the per-file CRC-32 as the end-to-end test.** `dgcunp.exe` prints the CRC of the
    decoded data area; it must equal the CRC in the index.
+5. **Turn the encoder into an oracle.** Once the *encoder* reproduces a real stream
+   byte-for-byte, `encode(decode(real_stream)) == real_stream` becomes a cheap
+   pass/fail test for the decoder, and the first differing byte localises the divergence.
 
-Two bugs that cost real time and are worth remembering:
+Three bugs that cost real time and are worth remembering:
 
 * the CM coder's **context slot** is `BSR(state)`, and `BSR(0)` leaves the destination
   register untouched - the code pre-loads `1Fh`, so the answer is 31, not 0;
 * the decompiled `sym()`/symbol decoder **loses a `break`** in one branch if you transcribe
   it carelessly, which turns a 2-level symbol into a 32-level runaway and desynchronises
-  everything downstream.
+  everything downstream;
+* the CM coder's prepare pass **overwrites its own scale register** with the node value, so
+  the scale chain is `0x2000, node0, node1, ...` and not the running product.
 
 ---
 
@@ -231,3 +251,5 @@ Two bugs that cost real time and are worth remembering:
   block); it must keep building with `cl` from VC98.
 * Keep new findings in `NOTES-dgca-format.md` and update section 4 of this file when a stage
   of the codec is cracked.
+* Keep this file and the notes plain ASCII: the editor used here can silently introduce
+  UTF-8 punctuation that makes later patches fail to match.

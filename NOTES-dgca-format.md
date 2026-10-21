@@ -116,8 +116,10 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
 
   6b. Symbol coding (sub_427880 / sub_4271B0)
       gamma style: the value's bit length = the number of "small branch"
-      decisions, followed by (len-1) raw bits.  Model = 32 entries of
-      12 bit probabilities, all initialised to 2048.
+      decisions, followed by (len-1) raw bits (MSB first).  Model = 32
+      entries of 12 bit probabilities, all initialised to 2048.
+      NOTE: the encoder writes (len-1) raw bits, not len - an off by one
+      here desynchronises everything after the first symbol.
 
   6c. Context mixing literal coder (sub_427970 / sub_427260)
       order-1 (lit[256]) + order-2 (pair[65536]) models mixed with a 32 slot
@@ -132,6 +134,24 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       for the 8 context nodes of the previous byte, and a "restore" pass
       writes them back and applies the probability shift.
 
+      The prepare pass walks the context chain
+      ctx = prev|0x100, node = ctx>>1, ctx = node, ... and the SCALE for
+      level k is NOT the value computed at level k-1 but the NODE of level
+      k-1 (the encoder does `mov ecx, eax` at the end of every prepare
+      level, overwriting the scale register).  The scale chain is therefore
+      0x2000, node0, node1, node2, ...  Getting this wrong desynchronises
+      the models after the first literal, which is why a single-literal
+      block still decodes correctly while longer ones do not.
+
+      The context chain used by the prepare pass starts at the RAW previous
+      byte (not prev|0x100) while the restore pass starts at prev|0x100;
+      the two passes therefore touch different nodes.
+
+      VERIFIED: re-encoding the literal/run stream of a real archive
+      reproduces the archive's bytes exactly (e.g. "AAA" -> 004120000000
+      for the 4096 x 'A' sample), which validates the range coder, this
+      coder and the gamma symbol coder together.
+
   6d. Pre-transform (sub_424C30 / sub_424910)
       an LZ77 with an IMPLICIT distance: a 2 byte hash table maps
       (prev byte, byte) -> the last output position; the distance is
@@ -141,19 +161,23 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
 
   6e. LZ stage (sub_428270 / sub_428990)   *** NOT FULLY REVERSED ***
       The stage is size preserving: the entropy stream decodes to exactly
-      `v7` bytes, which is also the size of the pre-transform's output (the
-      literal bytes).  It is NOT a plain permutation: the histogram of the
-      decoded bytes differs from the histogram of the input, so the stage
-      also transforms the values (it reorders by 2-byte context and applies a
-      delta/order transform - the encoder contains a chi-square analysis that
-      picks the delta order, and the "column" variant is method A).
+      `v7` bytes, which is also the size of the pre-transform's output
+      (the literal bytes).  It is NOT a plain permutation: the histogram of
+      the decoded bytes differs from the histogram of the pre-transform's
+      output, so the stage transforms the values as well (it reorders by
+      2-byte context and applies a delta/order transform - the encoder
+      contains a chi-square analysis that picks the delta order, and the
+      "column" variant is method A).
       The decoder side (sub_428990) rebuilds a permutation table from the
       byte histogram and walks a chain:
         Block[cnt[src[i]]++] = i
         dest[k] = src[Block^k(start)]
-      This is implemented in dgcunp.c but does not yet reproduce the original
-      order, so the *index* of a compressed archive still decodes to garbage.
-      The start index and the exact meaning of the chain are the open items.
+      That chain preserves the byte multiset, so it cannot invert a delta
+      transform - one of the two readings is still wrong.  The open items
+      are the exact role of the chain (which buffer it consumes) and the
+      start index (the block header's +0x10, "v22", is a candidate).
+      This is what still blocks reading the index of a compressed
+      archive.
 
   6f. Solid mode uses the "column" method (flags bit 2 set, delta order in
       bits 16..31) which is a different transform - not implemented.

@@ -352,7 +352,8 @@ static u32 cm_literal(rng_t *r, cm_t *C, int prev)
             saved[i + k] = v17;
             if (v15 & 1) { v18 = (v13 * (4096u - v17)) >> 13; v19 = v18 + v17; }
             else         { v18 = (v13 * v17) >> 13;       v19 = v17 - v18; }
-            v13 = v18;
+            /* the scale for the next level is the NODE value, not the product */
+            v13 = v16;
             lit[v16] = v19;
             idx = v16;
         }
