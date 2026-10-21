@@ -246,6 +246,22 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       => the run symbol's model is off by the same kind of error as the
       literal model, so the bug is in the shared model update (the
       prepare/restore passes), not in the literal coder alone.
+      IMPORTANT: the tool's own decompressor round trips perfectly (the
+      extraction of tiny\twoblk.dgc is byte identical to the original
+      file), so the encoder and the decoder really do agree - the decoder
+      is reproducible and the token stream really is a permutation of the
+      literals.
+      Decoding the first literal of the 6 byte case with a CONSTANT model
+      (all the probabilities 2048) gives 0x42 and never 0x41, no matter how
+      the range decoder is initialised (48 variants of the skip/code/
+      range/prev were tried).  So in the tool the probabilities of the
+      7th and 8th bit of the first literal are NOT 2048, i.e. the prepare
+      pass must have touched lit[80] and lit[160] - the two deepest nodes
+      of the current byte's tree.  The prepare pass can only touch them if
+      its chain is the CURRENT byte (0x41|0x100 = 0x141 has the nodes
+      160, 80, 40, ...), and a decoder cannot know the current byte
+      before it has read the model - which is the contradiction to
+      resolve.
       Two variants each nail ONE of the cases exactly, so the truth is
       close to both but is not in the searched space (4608 combinations of
       the prepare/restore direction, the scale chain, the chain byte, the
