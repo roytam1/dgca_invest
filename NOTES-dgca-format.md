@@ -277,6 +277,14 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
           prepares from the deepest node up (so the scale of a level is
           the node of the level below it), while a decoder working from
           the root down would have to use the node of the level above it.
+      Another very telling data point: with the scale chain
+      "0x2000, node0*128, node1*128, ..." (128 = 2^7 and the block header's
+      +08 = 7 for the 6 byte case!) and the initial previous byte 0xFF the
+      6 byte case is decoded EXACTLY ("AAAAAA"), while the 4 and 5 byte
+      cases (whose +08 is 7 as well) are not - so the multiplier is not
+      simply derived from the header either, and the 6 byte case only has
+      ONE symbol: the second symbol (and the run symbol) is what is still
+      wrong.
       Two variants each nail ONE of the cases exactly, so the truth is
       close to both but is not in the searched space (4608 combinations of
       the prepare/restore direction, the scale chain, the chain byte, the
