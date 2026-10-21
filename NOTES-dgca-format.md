@@ -200,6 +200,25 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       for the pair table and byte*128 bytes = byte*32 dwords for the run
       table).  The run model's shift is this[0x28] = p_run.
 
+      OPEN - which byte the chain of the prepare/restore passes walks.
+      The encoder passes the previous byte (arg_24 = var_484C6) and the
+      decoder passes ... the object field this[0x24] (arg_20) which the
+      disassembly says is p_ctx - a constant per block.  A 6 byte test
+      case (a 1000 byte file "A"*500 + "B"*500, whose token stream must be
+      "AAAAAA" because the pre-transform's model says so) shows that the
+      chain must contain the node 80 = (0x141)>>2, i.e. the chain is
+      0x141 = 0x41|0x100 - the CURRENT byte, not the previous one:
+      the first literal decodes as 0x42 instead of 0x41 and the 7th bit
+      is the first one that differs, and the probability of that bit can
+      only differ from 2048 if lit[80] was touched by the prepare pass.
+      So the prepare/restore chain is the current byte's chain (its nodes
+      are exactly the 8 nodes the main loop reads, in reverse order).
+      That is impossible for a decoder that has to read the model before
+      it knows the byte, so either the main loop must read the UNPREPARED
+      model (the prepare is a deferred update) or the decoder has to apply
+      the prepare's effect incrementally while it decodes the bits.
+      This is the last known gap in the CM coder.
+
       The argument lists of the two functions are NOT the same, and mixing
       them up was the cause of a whole afternoon of confusion:
         encoder sub_427970: arg_0 lit table, arg_4 &pair[prev*256],
@@ -211,12 +230,10 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
         decoder sub_427260: arg_0 lit table, arg_4 &pair[prev*256],
             arg_8 &pair[0] (the restore adds decoded*256), arg_C &ctx[slot],
             arg_10 p_lit, arg_14 p_pair, arg_18 p_pairb, arg_1C p_run,
-            arg_20 = the PREVIOUS byte (the prepare/restore chain),
+            arg_20 = the chain (this[0x24]),
             arg_24 = &state
-      => the chain of the prepare/restore passes is the PREVIOUS BYTE in
+      => the chain of the prepare/restore passes is the PREVIOUS byte in
       both, and the main loop's path is the current byte's 9 bit tree.
-      (In the encoder the previous byte is the local var_484C6, in the
-      decoder it is the register bl.)
 
       VERIFIED: the range coder, this coder and the gamma symbol coder
       together reproduce real stream A bytes exactly for several archives

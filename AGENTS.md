@@ -130,9 +130,17 @@ decoder side: `stream A -> entropy -> LZ inverse -> pre-transform inverse`.
   * the **restore** pass: same chain, `lit[node] = saved +/- (saved>>p_lit)` and
     `pair[cur*256+node] +/- (>>p_pairb)`.
   * the **pair** index is `prev*256+node`, the **run** index is `cur*32+value`.
-  * the chain of the prepare/restore passes is the **previous byte** in the encoder *and* in
-    the decoder (the two functions have different argument lists - see the notes; mixing them
-    up cost a whole afternoon).
+  * the chain of the prepare/restore passes: the disassembly says the
+    *previous* byte (the encoder passes var_484C6, the decoder the object
+    field this[0x24]) - but a 6 byte test case (a 1000 byte file
+    "A"*500+"B"*500, whose token stream must be "AAAAAA") shows that the
+    chain has to contain the node 80 = (0x141)>>2, i.e. the chain is the
+    *current* byte (0x41|0x100).  The first literal decodes as 0x42
+    instead of 0x41 and the 7th bit is the first wrong one, and that bit's
+    probability can only differ from 2048 if lit[80] was touched by the
+    prepare pass.  Either the main loop must read the *unprepared* model
+    or the decoder has to apply the prepare's effect incrementally while
+    it decodes the bits - this is the last known gap in the CM coder.
   * *Open*: with the settings the disassembly prescribes the index (IFDT) blocks decode
     byte exactly but the DATA blocks do not.
 * **Pre-transform** - LZ77 with an *implicit distance*: a 2-byte hash table maps
