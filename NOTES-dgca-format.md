@@ -249,11 +249,22 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
         matches v7 exactly, so the literal positions are known and the
         literals themselves can be computed - the strongest oracle yet
         (any single wrong symbol destroys the histogram).
-      * The chain walk also pins the ORDER: the token stream is the
-        literals reordered by the chain, i.e. the values grouped
-        ascending, the group containing the start index first, the
-        within-group order the original one.  The start index is the
-        block's v22 (a candidate, not confirmed).
+      * The chain walk also pins the ORDER exactly.  The chain walk groups
+        the positions by byte value, ascending, and follows Block[] from
+        the start index, so the token stream is
+            token_stream[chain[k]] = literals[k]
+        with chain = the positions 28,29,...,116,0,1,...,27 for the
+        v100e name list (the start index is the block's v22 - a candidate,
+        not confirmed).  Everything about the expected token stream can
+        therefore be computed byte for byte, and the first token is
+        literals[0] (0x09) at position 28, not at position 0.
+      * The first token of the decoder IS 0x09 (the model is the initial
+        one there, so it is model independent) - the decoder is right for
+        the first literal and wrong from the second, which pins the fault
+        to the model update rather than to the range coder or the start
+        of the stream (96 range initialisations were tried; none changes
+        the first literal, and no initialisation yields the expected
+        second literal either).
       * What is left is not a parameter: with the 117 byte oracle, 73728
         combinations (initial model values, prepare/restore chain,
         direction, scale chain, initial previous byte) and 96 range
