@@ -220,14 +220,18 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       know the current byte before it has read the model, so either the
       main loop must read the *unprepared* model, or the decoder has to
       apply the prepare's effect while it decodes the bits.
-      Making the prepare's update 128 times bigger (i.e. the scale chain
-      "0x2000, node0*128, node1*128, ...") reproduces the 6 byte case
-      exactly but breaks the other cases, so it is a compensation for a
-      still unknown bug, not the truth.
-      The 6 byte case is the ideal regression test: it is in
-      tiny\twoblk.dgc (with tiny\twoblk.bin and tiny\twoblk.n.dgc), and
-      tiny\ab1000.dgc / tiny\abc1000.dgc are the 4 and 5 byte variants
-      (their token streams must be permutations of "ABAB" and "ABCAB").
+      Making the prepare's update 64 times bigger (the scale chain
+      "0x2000, node0*64, node1*64, ...") makes the FIRST literal of the
+      6 byte case come out right (0x41) but the second one wrong, and
+      making it 128 times bigger reproduces the whole 6 byte case exactly
+      but breaks the 4 and 5 byte cases - so the scale chain is close to
+      right but not exactly, and there is at least one more bug (most
+      likely in the restore pass, which is what makes the NEXT symbol's
+      model different).  The 6 byte case is the ideal regression test: it
+      is in tiny\twoblk.dgc (with tiny\twoblk.bin and tiny\twoblk.n.dgc),
+      and tiny\ab1000.dgc / tiny\abc1000.dgc are the 4 and 5 byte
+      variants (their token streams must be permutations of "ABAB" and
+      "ABCAB").
 
       The argument lists of the two functions are NOT the same, and mixing
       them up was the cause of a whole afternoon of confusion:
