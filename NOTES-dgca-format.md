@@ -385,6 +385,16 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
           pre-transform's literals.  The literals are known exactly (the
           pre-transform can be re-run over the plaintext, see 6d), so this
           is a true oracle.
+      (3) "end to end" test (the strongest): take the decoded token
+          stream, run the chain walk (sub_428990) over every possible
+          start index, then run the inverse pre-transform (the LZ77 with
+          the implicit distance) on the result and compare with the
+          original file.  It validates the token stream, the chain walk's
+          start index and the LZ77's inverse at once, and it is the test
+          that finally settles the LZ stage: with the right token stream
+          the start index falls out of the brute force.  The script is
+          e2e.py in the scratch dir (it also decodes the model stream B
+          and rebuilds the literals from the plaintext).
       The best blocks to use as oracles (the longest stream A in the sample
       archives): t1000.bin.dgc/DATA (269 bytes), m_700.dgc/DATA (269),
       m_300_300.dgc/DATA (250), m_100_200_300.dgc/DATA (245),

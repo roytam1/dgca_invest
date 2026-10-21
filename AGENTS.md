@@ -179,6 +179,11 @@ decoder side: `stream A -> entropy -> chain walk -> pre-transform inverse`.
     tiny archives made with `dgcac` from 1000 byte files; the pre-transform's model
     says exactly what the token stream has to be, and each decode is a pass/fail in
     about a millisecond.
+  * **The end-to-end test** (e2e.py in the scratch dir) is the strongest oracle:
+    decoded token stream -> chain walk (over every start index) -> inverse
+    pre-transform -> compare with the original file.  It validates the token stream,
+    the chain walk's start index and the LZ77's inverse at once.  It is the test
+    that will finally settle the LZ stage.
   * Two near misses: the scale chain `0x2000, node0*128, node1*128, ...` with the
     initial previous byte `0xFF` decodes `twoblk` exactly, and the prepare's direction
     flipped (the same as the restore's) with the disassembly's scale chain and the
