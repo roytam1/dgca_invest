@@ -232,6 +232,16 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       and tiny\ab1000.dgc / tiny\abc1000.dgc are the 4 and 5 byte
       variants (their token streams must be permutations of "ABAB" and
       "ABCAB").
+      A PERFECT, TINY, INDEPENDENT ORACLE: the name list.  The IFNM block
+      of dgca_v100e.dgc is 117 bytes and the tool's own listing
+      ("dgcac l <archive>") prints the names, so the name list's plaintext
+      can be rebuilt exactly (u32 length + the name, per entry) - the
+      rebuilt blob is 117 bytes, which matches the block's original size
+      exactly, so the reconstruction is proven.  The block's token stream
+      must be a permutation of those 117 bytes, which is a pass/fail test
+      in about a millisecond.  (The index block of 512 bytes is a second,
+      weaker oracle: most of an index entry is zeros and the CRCs of the
+      stored files are not known.)
       More real world samples: the SFX stripped archives in the work area
       root, dgca_beta1.dgc and dgca_v100e.dgc, contain blocks from 117
       bytes up to 839680 bytes (up to 773298 literals and a 410631 byte CM
