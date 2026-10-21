@@ -98,14 +98,14 @@ DGCA
 
 ## 4. The codec (status)
 
-Pipeline, encoder side:
+Pipeline, encoder side (from the disassembly of `sub_425600`):
 
 ```
-[pre-transform] -> [LZ stage] -> [entropy coder] -> stream A
+[LZ stage] -> [pre-transform] -> [entropy coder] -> stream A
 pre-transform model                        -> stream B
 ```
 
-decoder side: `stream A -> entropy -> LZ inverse -> pre-transform inverse`.
+decoder side: `stream A -> entropy -> chain walk -> pre-transform inverse`.
 
 **Solved and byte-verified:**
 
@@ -160,7 +160,7 @@ decoder side: `stream A -> entropy -> LZ inverse -> pre-transform inverse`.
   `Block[cnt[src[i]]++] = i` -> `dest[k] = src[Block^k(start)]`; the start index is
   `*(u32*)arg_C` (arg_C is a *pointer*).
 * **The LZ stage is a PURE PERMUTATION** (`sub_428270` builds an index array and copies
-  the bytes unchanged) - so the token stream has the same byte histogram as the
+  the bytes unchanged) - so the token stream must have the same byte histogram as the
   literals.  The earlier "it also applies a delta" note was WRONG.
 
 **Still open:**
@@ -169,6 +169,20 @@ decoder side: `stream A -> entropy -> LZ inverse -> pre-transform inverse`.
   (`encode(decode(A)) == A`) is only a self-consistency test and cannot see this; the
   real oracle is the **histogram**: the token stream must have the same byte histogram
   as the literals (which are known exactly).  It currently fails.
+  * The bug is in the **prepare/restore passes** of the CM coder (the run symbol is off
+    by the same kind of error as the literal model), and it is *not* a single toggle:
+    a search over 4608 combinations (prepare/restore direction, scale chain, chain
+    byte, pair/run model bases, value assembly, initial previous byte) satisfies at
+    most one of the three regression cases.
+  * **The three regression cases** are the way in: `tiny\twoblk.dgc` (the token stream
+    must be "AAAAAA"), `tiny\ab1000.dgc` ("ABAB") and `tiny\abc1000.dgc` ("ABCAB") -
+    tiny archives made with `dgcac` from 1000 byte files; the pre-transform's model
+    says exactly what the token stream has to be, and each decode is a pass/fail in
+    about a millisecond.
+  * Two near misses: the scale chain `0x2000, node0*128, node1*128, ...` with the
+    initial previous byte `0xFF` decodes `twoblk` exactly, and the prepare's direction
+    flipped (the same as the restore's) with the disassembly's scale chain and the
+    initial previous byte `0` decodes `ab1000` exactly ("BBAA").
 * **The chain walk's start index** - the normal path passes the destination buffer as
   `arg_C` (which would read uninitialised memory), the column path passes the block
   header.  The start index has to be found (v22, the block header's +0x10, is a candidate).
@@ -177,7 +191,7 @@ decoder side: `stream A -> entropy -> LZ inverse -> pre-transform inverse`.
 * **Encryption** (`-p` / `-k`) is fully specified in `NOTES-dgca-format.md` section 8 (the
   cipher, the SHA-512/MT19937 key derivation and exactly what gets encrypted) but is not
   implemented in `dgcunp.c` yet. A ready-made test pair: `dgcac a plain.dgc src` vs
-  `dgcac a -p secret enc.dgc src` differ only in the chunk header CRC fields and in the
+  `dgcac a -p secret enc.dgc src` differ only at the chunk header CRC fields and in the
   `DGCC` chunk.
 
 ---
