@@ -139,6 +139,9 @@ decoder side: `stream A -> entropy -> LZ inverse -> pre-transform inverse`.
   `(prev byte, byte) -> last output position`; the distance is never transmitted, the
   decoder rebuilds the same table. `minmatch = 1 << this[14]`. Stream B carries
   `(literal run length, match length - minmatch)` pairs; their sum is the original size.
+  * VERIFIED byte exact: re-running the LZ77 over the plaintext of a stored twin
+    reproduces the archive's stream B byte for byte and the number of literals equals
+    `v7` (3 archives: dgca100, dgca110, dgca-beta1 - `minlen = 1<<6`, model shift 4).
 * **Block header** - `size` = the *original* size, `v7` = the size fed to the entropy coder
   (= the size of the pre-transform's output, the literal bytes). (Easy to mix up; `v7` is
   what the decoder must produce from stream A.)
@@ -148,18 +151,19 @@ decoder side: `stream A -> entropy -> LZ inverse -> pre-transform inverse`.
 * **Chain walk** (`sub_428990`, fully known): histogram -> prefix sums ->
   `Block[cnt[src[i]]++] = i` -> `dest[k] = src[Block^k(start)]`; the start index is
   `*(u32*)arg_C` (arg_C is a *pointer*).
+* **The LZ stage is a PURE PERMUTATION** (`sub_428270` builds an index array and copies
+  the bytes unchanged) - so the token stream has the same byte histogram as the
+  literals.  The earlier "it also applies a delta" note was WRONG.
 
 **Still open:**
 
-* **The LZ stage** (`sub_428270` / `sub_428990`) - the last blocker for reading the index
-  of a compressed archive. The stage is size preserving and groups equal byte values
-  together, but it also changes the values (a delta/order transform; the encoder contains
-  a chi-square analysis that picks the delta order, and the "column" variant is method A).
-  The open items are the exact role of the chain (which buffer it consumes - the literals
-  or the original data; the sizes only agree for the literals) and the start index.
-* **The CM literal coder's chain** - see above; no variant reproduces all 11 test blocks
-  yet (the best get 3 of 11 byte exact; the index blocks behave much better than the
-  data blocks, which points at the run symbol or the LZ stage).
+* **The entropy decoder still produces wrong bytes.**  The re-encode test
+  (`encode(decode(A)) == A`) is only a self-consistency test and cannot see this; the
+  real oracle is the **histogram**: the token stream must have the same byte histogram
+  as the literals (which are known exactly).  It currently fails.
+* **The chain walk's start index** - the normal path passes the destination buffer as
+  `arg_C` (which would read uninitialised memory), the column path passes the block
+  header.  The start index has to be found (v22, the block header's +0x10, is a candidate).
 * **Solid mode "column" method** (method A) - flags bit 2, delta order in bits 16..31.
   Sizes come out right, content is wrong.
 * **Encryption** (`-p` / `-k`) is fully specified in `NOTES-dgca-format.md` section 8 (the

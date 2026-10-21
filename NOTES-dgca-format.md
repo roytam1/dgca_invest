@@ -229,6 +229,16 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       never transmitted, the decoder rebuilds the same table.
       min match = 1 << this[14].  The model stream (stream B) carries
       (literal run length, match length - minlen) pairs.
+      VERIFIED (2026-10-21): re-running the LZ77 over the plaintext of a
+      stored twin reproduces the archive's stream B byte for byte and the
+      number of literals equals v7 exactly, e.g.
+        dgca100-normal.dgc   DATA: 7411 bytes -> 6955 literals, stream B
+                             (21 bytes) reproduced exactly with
+                             minlen = 1<<6, model shift = 4
+        dgca-beta1-normal.dgc DATA: 9846 bytes -> 9306 literals, same
+      So the pre-transform runs on the ORIGINAL data and its output
+      (the literals) is what the entropy coder sees - possibly after the
+      LZ stage (see 6e).
 
   6e. LZ stage (sub_428270 / sub_428990)   *** NOT FULLY REVERSED ***
       The decoder side (sub_428990) is fully known:
@@ -240,58 +250,71 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
         4. dest[k] = src[Block^k(start)]      (a chain walk)
         The start index is read as *(u32*)arg_C, i.e. arg_C is a POINTER to
         a structure whose first dword is the start index.  In the "column"
-        path the caller passes the block header's +0x10 (v22) area; in the
-        normal path it passes the destination buffer pointer itself, which
-        looks like a bug or at least an anomaly that has to be explained.
-      The walk preserves the byte multiset, so the LZ stage must be a pure
-      permutation of its input.
-
-      What is known about the encoder side (sub_428270): it is applied to
-      the original block data, it is size preserving, it groups equal byte
-      values together (the decoded LZ output of the 390 byte "hello world"
-      sample is 21 49 8f*29 ff ef*3 99 23*2 0a*4 09 02 30*2 ca 37*29 - the
-      values are clustered) and it changes the multiset, so besides the
-      reordering it also transforms the values (delta/order transform; the
-      encoder contains a chi-square analysis that picks the delta order and
-      the "column" variant is method A).
-      The open items: which buffer the chain consumes (the literals or the
-      original data - see the pipeline note in section 6), the exact start
-      index, and where the delta is inverted.
+        path the caller passes the block header; in the normal path it
+        passes the destination buffer pointer itself, which looks like a
+        bug or at least an anomaly that has to be explained.
+      The walk is a PURE PERMUTATION and it groups the equal byte values
+      together - and indeed the decoded token stream has its values
+      clustered (the 6955 bytes of the dgca100 DATA block decode into only
+      1449 (literal,run) symbols, i.e. the equal values are adjacent).
+      The encoder side (sub_428270) confirms this: it builds an index
+      array (a permutation) and the output bytes are copied from the source
+      unchanged - so the LZ stage is a pure reordering and the token stream
+      has exactly the same byte histogram as the pre-transform's literals.
+      (The earlier assumption that the stage also applies a delta was
+      wrong; the chi-square analysis of sub_4244E0 is a separate look
+      ahead that the encoder calls AFTER the LZ stage.)
+      What is still unexplained: the decoded token stream's histogram does
+      NOT match the literals' histogram, so the entropy decoder still
+      produces wrong bytes (the re-encode test cannot see that, see 6g).
+      The open items: the exact start index of the chain walk and the bug in
+      the entropy decoder.
       This is what still blocks reading the index of a compressed archive.
 
   6f. Solid mode uses the "column" method (flags bit 2 set, delta order in
       bits 16..31) which is a different transform - not implemented.
 
   6g. EMPIRICAL ORACLE for the entropy coder
-      The best test for the CM coder is: decode stream A, then RE-ENCODE the
-      decoded bytes and compare with the original stream A.  A byte exact
-      match proves that the whole model evolution (range coder, CM coder,
-      symbol coder) is identical to the tool's.
-      Scripts (scratch dir, "opencode\dgca"):
-        pdec.py     the parameterised CM decoder (all the model variants)
-        bf5.py      the matching CM encoder (the oracle)
-        joint2.py   the joint search over the variants, scored on 11 blocks
-        chain4.py   the chain variant matrix
+      Two tests are available and they are NOT equivalent:
+      (1) "re-encode" test: decode stream A, re-encode the decoded bytes and
+          compare with stream A.  This only proves that the decoder and the
+          encoder are mutual inverses - it does NOT prove that the decoded
+          bytes are the ones the tool encoded, because a different token
+          stream can be mapped to the same stream by a different encoder.
+          It was used for a long time and is misleading.
+      (2) "histogram" test: the LZ stage is a PURE PERMUTATION (verified in
+          the disassembly of sub_428270: it builds an index array and the
+          output bytes are copied from the source unchanged), so the token
+          stream must have exactly the same byte histogram as the
+          pre-transform's literals.  The literals are known exactly (the
+          pre-transform can be re-run over the plaintext, see 6d), so this
+          is a true oracle.
       The best blocks to use as oracles (the longest stream A in the sample
       archives): t1000.bin.dgc/DATA (269 bytes), m_700.dgc/DATA (269),
       m_300_300.dgc/DATA (250), m_100_200_300.dgc/DATA (245),
       m_100_200_300.dgc/IFDT (76), m_300_300.dgc/IFDT (65),
       orc/idn.dgc/IFDT (35), c_hello.dgc/DATA (27), c_hello.dgc/IFDT (30).
-      Result of the search (2026-10-21): with the settings that the
-      disassembly prescribes (chain = the previous byte, scale = the node,
-      first scale 0x2000, prep_inv = rest_inv = 0) the INDEX blocks
-      (IFDT) are reproduced byte exactly (e.g. m_100_200_300.dgc/IFDT
-      76/76, m_300_300.dgc/IFDT 65/65, orc/idn.dgc/IFDT 33..35/35,
-      c_hello.dgc/DATA 25..27/27 depending on the scale) but the DATA
-      blocks are not (t1000.bin.dgc/DATA only 21 of 269 bytes).  A variant
-      that uses the *updated lit value* instead of the node as the scale
-      fixes the c_hello blocks and m_300_300.dgc/IFDT but breaks
-      m_100_200_300.dgc/IFDT, and the disassembly is unambiguous about
-      the node (0x4279E0 `mov ecx, eax`), so that variant is a
-      compensation for a still unknown bug, not the truth.  The symbol
-      coder itself is verified line by line against sub_427880 (encoder)
-      and sub_4271B0 (decoder) and matches the implementation in bf5.py /
-      pdec.py exactly.
+      The new test pairs in the work area root are even better:
+      dgca100-normal.dgc / dgca100-store.dgc (7411 bytes of data,
+      6955 literals, a 2899 byte stream A), dgca110-* (7691 bytes) and
+      dgca-beta1-* (9846 bytes).
+      Scripts (scratch dir, "opencode\dgca"):
+        pdec.py     the parameterised CM decoder (all the model variants)
+        bf5.py      the matching CM encoder
+        pt.py       the pre-transform (verified against stream B)
+        perm3.py    the histogram oracle for one block
+        joint*.py   the joint variant searches
+        chain4.py   the chain variant matrix
+        symwise2.py the symbol-by-symbol re-encode comparison
+        walk*.py    the chain walk experiments
+      Result of the search (2026-10-21): the CM decoder reproduces the
+      archive's stream A byte for byte for the single symbol blocks
+      (4096 x 'A' -> the token stream "AAA") and for the 21 symbol
+      c_hello.dgc/DATA block, but the histogram test still fails (the token
+      stream's histogram does not match the literals'), so the decoder is
+      still wrong in a way the re-encode test cannot see.  The token
+      stream's values are grouped (the equal values are adjacent), which is
+      what the chain walk undoes.
 
 7. -r RECOVERY DATA
 -------------------
