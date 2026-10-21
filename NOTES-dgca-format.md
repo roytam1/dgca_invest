@@ -232,6 +232,17 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       and tiny\ab1000.dgc / tiny\abc1000.dgc are the 4 and 5 byte
       variants (their token streams must be permutations of "ABAB" and
       "ABCAB").
+      More real world samples: the SFX stripped archives in the work area
+      root, dgca_beta1.dgc and dgca_v100e.dgc, contain blocks from 117
+      bytes up to 839680 bytes (up to 773298 literals and a 410631 byte CM
+      stream).  All three tool versions (the repo's dgcac.exe, the beta and
+      v100e) produce BYTE IDENTICAL streams for the same input, i.e. they
+      share the same CM coder - they are extra test data, not a different
+      variant.  The smallest block (117 bytes, a 77 byte CM stream) decodes
+      with a re-encode match of 76 of 77 bytes - the best result so far:
+      the model error is cumulative, so the bigger blocks diverge earlier
+      (the 7411 byte block: 985 of 2899 bytes; the 839680 byte block:
+      440 of 410631).
       What the three cases show (the token stream must be a permutation
       of the literals, the LZ stage being a pure permutation):
         twoblk  : the token stream is "AAAAAA" = ONE symbol (the literal
