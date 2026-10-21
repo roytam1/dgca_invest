@@ -130,9 +130,11 @@ decoder side: `stream A -> entropy -> LZ inverse -> pre-transform inverse`.
   * the **restore** pass: same chain, `lit[node] = saved +/- (saved>>p_lit)` and
     `pair[cur*256+node] +/- (>>p_pairb)`.
   * the **pair** index is `prev*256+node`, the **run** index is `cur*32+value`.
-  * *Open*: the chain of the prepare/restore passes. The encoder passes the **previous byte**
-    (`arg_24`), the decoder passes the object field `this[0x24]` which is read **once per block**
-    (so it is constant). Neither reading reproduces every archive yet.
+  * the chain of the prepare/restore passes is the **previous byte** in the encoder *and* in
+    the decoder (the two functions have different argument lists - see the notes; mixing them
+    up cost a whole afternoon).
+  * *Open*: with the settings the disassembly prescribes the index (IFDT) blocks decode
+    byte exactly but the DATA blocks do not.
 * **Pre-transform** - LZ77 with an *implicit distance*: a 2-byte hash table maps
   `(prev byte, byte) -> last output position`; the distance is never transmitted, the
   decoder rebuilds the same table. `minmatch = 1 << this[14]`. Stream B carries

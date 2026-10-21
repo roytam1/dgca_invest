@@ -171,7 +171,7 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       for the 8 context nodes of a chain, and a "restore" pass writes them
       back and applies the probability shift.
 
-      The prepare pass (verified in the disassembly):
+      The prepare pass (verified in the disassembly of sub_427970):
         chain = arg|0x100 ; 8 levels:
             node  = chain>>1 ; saved[k] = lit[node]
             bit   = chain&1
@@ -181,29 +181,42 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
                                      level k-1, not the running product)
             chain = node
         the first scale is 0x2000 (`mov ecx, 2000h`).
+        With chain = prev|0x100 and prev = 0 the scale chain is
+        0x2000, 0x80, 0x40, 0x20, 0x10, 8, 4, 2 - a geometric hierarchy, and
+        the tentative update of a level is of the same order as the shift
+        the restore pass applies to the same node (that is the point of the
+        prepare pass: the model is adapted to the symbol before it is
+        coded, without changing the final state).
       The restore pass uses the SAME chain and does
         lit[node] = saved +/- (saved >> p_lit)
         pair[cur*256 + node] +/- (pair >> p_pairb)
       The main loop mixes the two models:
         pr = (w*lit[node] + (4096-w)*pair[prev*256+node]) >> 12
-      with w = ctx[BSR(state)] (31 when the state is 0).
-
+      with w = ctx[BSR(state)] (31 when the state is 0), and updates
+        lit[node]   toward the coded bit (>> p_lit)
+        pair[prev*256+node] toward the coded bit (>> p_pair)
       The pair model index is prev*256+node and the run model index is
       cur*32+value (the caller passes byte*1024 bytes = byte*256 dwords
       for the pair table and byte*128 bytes = byte*32 dwords for the run
       table).  The run model's shift is this[0x28] = p_run.
 
-      OPEN - the "chain" of the prepare/restore passes:
-        the ENCODER calls sub_427970 with arg_20 = the current byte and
-        arg_24 = the previous byte; the prepare/restore chain is arg_24
-        (= previous byte|0x100) and the pair base is also previous*256.
-        The DECODER calls sub_427260 with arg_24 = the previous byte (the
-        pair base) and arg_20 = the object field this[0x24] (the chain),
-        and that field is read ONCE per block - so the decoder's chain is
-        constant while the encoder's varies with the previous byte.
-        The two cannot both be right, and empirically neither the
-        "previous byte" chain nor the "constant" chain reproduces every
-        archive (see below), so one of the two readings is still wrong.
+      The argument lists of the two functions are NOT the same, and mixing
+      them up was the cause of a whole afternoon of confusion:
+        encoder sub_427970: arg_0 lit table, arg_4 &pair[prev*256],
+            arg_8 &pair[cur*256], arg_C &ctx[slot], arg_10 p_lit,
+            arg_14 p_pair, arg_18 p_pairb, arg_1C p_ctx,
+            arg_20 = the CURRENT byte (the main loop's path),
+            arg_24 = the PREVIOUS byte (the prepare/restore chain),
+            arg_28 = &state
+        decoder sub_427260: arg_0 lit table, arg_4 &pair[prev*256],
+            arg_8 &pair[0] (the restore adds decoded*256), arg_C &ctx[slot],
+            arg_10 p_lit, arg_14 p_pair, arg_18 p_pairb, arg_1C p_run,
+            arg_20 = the PREVIOUS byte (the prepare/restore chain),
+            arg_24 = &state
+      => the chain of the prepare/restore passes is the PREVIOUS BYTE in
+      both, and the main loop's path is the current byte's 9 bit tree.
+      (In the encoder the previous byte is the local var_484C6, in the
+      decoder it is the register bl.)
 
       VERIFIED: the range coder, this coder and the gamma symbol coder
       together reproduce real stream A bytes exactly for several archives
@@ -264,14 +277,21 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       m_300_300.dgc/DATA (250), m_100_200_300.dgc/DATA (245),
       m_100_200_300.dgc/IFDT (76), m_300_300.dgc/IFDT (65),
       orc/idn.dgc/IFDT (35), c_hello.dgc/DATA (27), c_hello.dgc/IFDT (30).
-      Result of the search (2026-10-21): no variant of {prepare chain,
-      restore chain, scale, run context} reproduces ALL of them; the best
-      ones get 3 of 11 blocks byte exact.  The index (IFDT) blocks behave
-      much better than the DATA blocks, which points at the run length
-      symbol or at the LZ stage rather than at the CM literal coder.
-      The symbol coder itself is now verified line by line against
-      sub_427880 (encoder) and sub_4271B0 (decoder) and matches the
-      implementation in bf5.py / pdec.py exactly.
+      Result of the search (2026-10-21): with the settings that the
+      disassembly prescribes (chain = the previous byte, scale = the node,
+      first scale 0x2000, prep_inv = rest_inv = 0) the INDEX blocks
+      (IFDT) are reproduced byte exactly (e.g. m_100_200_300.dgc/IFDT
+      76/76, m_300_300.dgc/IFDT 65/65, orc/idn.dgc/IFDT 33..35/35,
+      c_hello.dgc/DATA 25..27/27 depending on the scale) but the DATA
+      blocks are not (t1000.bin.dgc/DATA only 21 of 269 bytes).  A variant
+      that uses the *updated lit value* instead of the node as the scale
+      fixes the c_hello blocks and m_300_300.dgc/IFDT but breaks
+      m_100_200_300.dgc/IFDT, and the disassembly is unambiguous about
+      the node (0x4279E0 `mov ecx, eax`), so that variant is a
+      compensation for a still unknown bug, not the truth.  The symbol
+      coder itself is verified line by line against sub_427880 (encoder)
+      and sub_4271B0 (decoder) and matches the implementation in bf5.py /
+      pdec.py exactly.
 
 7. -r RECOVERY DATA
 -------------------
