@@ -570,6 +570,50 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
         but the key material that the writer derives is not (8.7), and
         the match coder (the params' bit 1).
 
+  dgcpk.c   MSVC6, C89.  the PACKER (the archiver):
+         dgcpk a [-n] [-f] [-i] [-r<n>] <archive> <file>...
+           -n     do not compress (the blocks are stored)
+           -f     one block per file (not the solid mode)
+           -i     identity: do not write the time stamps
+           -r<n>  append the recovery data (the parity table)
+  It writes the same format as dgcac.exe and the archives it writes are
+  read back by dgcac.exe ("dgcac l", "dgcac e" - the extracted files are
+  byte identical) and by dgcunp.c.  The CM coder of dgcpk.c is byte
+  identical to the Python reference (cm.py).
+
+  9.1  HOW THE PACKER WORKS
+  -------------------------
+  * the data -> the pre-transform: an LZ77 with an implicit distance.
+    The hash table (65536 entries) maps the key ((the previous byte) << 8)
+    | the byte to the last position; a match is accepted when it is at
+    least minmatch (= 1 << the params' bits 24..27 = 64) bytes long and
+    when it does not overlap itself (the distance must be at least the
+    length - the decoder copies the match forward out of the output).
+    The output is the literals and the model stream (the pairs of the
+    literal run length and the match length - minmatch, coded with the
+    gamma symbol coder and the params' bits 28..31 = 4).
+  * the token buffer (the literals) -> the CM literal coder (stream A)
+    and the model stream -> stream B.
+  * the block: the tag 1, the original size, the flags, the params
+    (0x46453320 - the same as the tool's), v22, v7 (the token buffer's
+    size), lenA, lenB and the two streams.
+    The flags are 4 (the pre-transform): the packer does NOT use the
+    LZ stage (the chain walk), so the decoder skips it - the archives
+    are a little bigger than the tool's but they are read back by it.
+  * the index: the 64 byte entries (the CRC-32, the attributes, the two
+    FILETIMEs, the original size, the compressed size and the offset in
+    the DATA payload) stored TRANSPOSED, compressed like any other data.
+  * the name list: the pairs (the length, the name), the names are
+    relative to the current directory.
+  * the IARC: the flags, the version " 001", the time stamp, the number
+    of the entries, the total size, the size of the index table and the
+    size of the name blob.
+  * the chunk header: the id, 0x20, the payload size, 0, the flags, 1,
+    the CRC-32 of the payload and the CRC-32 of the 32 header bytes
+    with the last field zeroed.  Every chunk is padded to 16 bytes.
+  * the recovery data (-r<n>): the parity table of section 7.1 over the
+    archive's bytes, encrypted with the fixed key.
+
 10. VERIFICATION
 ---------------
   Every archive in the work area (and ~100 more in the scratch dir) is

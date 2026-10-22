@@ -9,6 +9,8 @@ dgcac.exe.lst    IDA disassembly listing (~5.3 MB)
 dgcac.exe.c      Hex-Rays decompiled C (~1.0 MB, 462 functions)
 dgcunp.c         unpacker / lister / repair tool written from this analysis
                  (MSVC6, C89)
+dgcpk.c          the packer (the archiver) written from this analysis
+                 (MSVC6, C89)
 NOTES-dgca-format.md   full format + codec + crypto specification
 ```
 
@@ -212,6 +214,7 @@ Current state of `dgcunp.c`:
 | long UTF-8 names (> MAX_PATH) | working - the wide APIs with the `\\?\` prefix |
 | the crypto of DGCA v1.10 (SHA-512, MT19937, PRNG, cipher, key derivation) | working - byte exact, verified against the original binary |
 | the recovery data (`-R`): the parity table, the repair, the archive's CRC-32 | working - a damaged `.dgcr` is repaired and extracted without errors |
+| the packer (`dgcpk.c`) | working - `dgcac.exe` reads back the archives it writes and the extracted files are byte identical |
 | encrypted archives | the crypto is known, the key material that the writer derives is not (see `NOTES-dgca-format.md` 8.7) |
 | the match coder (the params' bit 1) | not implemented (unused by the sample archives) |
 
