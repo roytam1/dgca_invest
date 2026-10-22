@@ -89,117 +89,89 @@ DGCA
   zero-padded to the next 16-byte boundary and **the padding counts** in the parent's
   `payload_size`.
 * `DGCC` payload = block stream: `u32 tag, u32 size`; `tag 0` STORE, `tag 1` COMPRESSED
-  (32-byte block header + stream A + stream B), `tag 2` CHAIN of `tag 1` blocks.
+  (32-byte block header + stream A + stream B), `tag 2` COLUMNS (`size` = the stride, `size`
+  `tag 1` blocks follow - the "column" method).
 * Per-file index entry (64 B): `+00` CRC-32 of the file, `+04` attributes, `+08/+10` FILETIME
   create/modify, `+18` original size, `+20` "compressed" size, `+28` offset in the DATA
   payload.
 
 ---
 
-## 4. The codec (status)
+## 4. The codec (SOLVED - byte exact)
 
-Pipeline, encoder side (from the disassembly of `sub_425600`):
+The whole compression codec is cracked and verified against every archive in
+the work area.  The details are in `NOTES-dgca-format.md` section 6; this is
+the summary.
+
+Pipeline (encoder side, from the disassembly of `sub_425600`):
 
 ```
-[LZ stage] -> [pre-transform] -> [entropy coder] -> stream A
+[pre-transform] -> [LZ stage] -> [entropy coder] -> stream A
 pre-transform model                        -> stream B
 ```
 
-decoder side: `stream A -> entropy -> chain walk -> pre-transform inverse`.
-
-**Solved and byte-verified:**
+decoder side: `stream A -> entropy -> chain walk -> (pre-transform inverse | delta)`.
 
 * **Range coder** - "carryless" variant.
   * encoder: `low=0, range=0x80000000`; emits `low>>23`, keeps 23 fraction bits, carry
     handled by a pending-`0xFF` counter; flush emits 5 more bytes.
   * decoder: **skip one byte** (the encoder's dummy byte), then `code = b>>1, range = 0x80`;
     renormalise `code = ((code<<1)|(prev&1))<<7 | (b>>1); range <<= 8`.
-  * *Proof*: re-encoding the pre-transform model stream of a real archive reproduces the
-    real bytes exactly (`003000fbd8800000` for 4096x`A`).
 * **Symbol coding** (gamma) - verified line by line against `sub_427880` (encoder) and
   `sub_4271B0` (decoder): the number of "small branch" decisions = the value's bit length,
   then `len-1` raw bits (MSB first). 32-entry, 12-bit probability models initialised to 2048.
+  * the decoder returns the LEVEL itself for the levels 0 and 1 (so the value 1 is one
+    "continue" bit and no raw bits) - getting this wrong desynchronises everything.
 * **CM literal coder** - order-1 (`lit[256]`) + order-2 (`pair[256*256]`) models mixed against a
   32-slot context table; the slot is `BSR(state)` and is **31 when the state is 0** (the encoder
   pre-loads `eax = 1Fh` before `bsr`). The literal is coded MSB first over a 9-bit tree:
   `node = 2*node + bit` (node starts at 1) and `value = 2*value + bit`, i.e. the first bit is the
   most significant.
-  * the **prepare** pass: 8 levels, `node = chain>>1`, `chain = node`, and the *scale* of level
-    k is the **node** of level k-1 (the encoder clobbers the scale register with
-    `mov ecx, eax`); the first scale is `0x2000`.
-  * the **restore** pass: same chain, `lit[node] = saved +/- (saved>>p_lit)` and
-    `pair[cur*256+node] +/- (>>p_pairb)`.
-  * the **pair** index is `prev*256+node`, the **run** index is `cur*32+value`.
-  * the chain of the prepare/restore passes: the disassembly says the
-    *previous* byte (the encoder passes var_484C6, the decoder the object
-    field this[0x24]) - but a 6 byte test case (a 1000 byte file
-    "A"*500+"B"*500, whose token stream must be "AAAAAA") shows that the
-    chain has to contain the node 80 = (0x141)>>2, i.e. the chain is the
-    *current* byte (0x41|0x100).  The first literal decodes as 0x42
-    instead of 0x41 and the 7th bit is the first wrong one, and that bit's
-    probability can only differ from 2048 if lit[80] was touched by the
-    prepare pass.  Either the main loop must read the *unprepared* model
-    or the decoder has to apply the prepare's effect incrementally while
-    it decodes the bits - this is the last known gap in the CM coder.
-  * *Open*: with the settings the disassembly prescribes the index (IFDT) blocks decode
-    byte exactly but the DATA blocks do not.
+  * the **prepare** pass walks the tree of the **previous byte** from the deepest node up:
+    `node_k = (prev|0x100) >> k`, `bit_k = (prev|0x100) >> (k-1) & 1`; `lit[node]` is moved
+    *toward* that bit by `((4096-lit) or lit) * scale >> 13` and **the scale of the next level
+    is that magnitude (the delta), not the node** - the first scale is `0x2000`.
+  * the **restore** pass walks the same nodes (bottom up) and writes
+    `lit[node] = saved +/- (saved>>p_lit)` and `pair[cur*256+node] +/- (>>p_pairb)`.
+  * the **pair** index is `prev*256+node` in the main loop and `cur*256+node` in the restore,
+    the **run** index is `cur*32+value`.
+  * the initial "previous byte" is 0xFF if the first byte of the block is 0 (the params' bit 0)
+    and 0 otherwise.
 * **Pre-transform** - LZ77 with an *implicit distance*: a 2-byte hash table maps
   `(prev byte, byte) -> last output position`; the distance is never transmitted, the
   decoder rebuilds the same table. `minmatch = 1 << this[14]`. Stream B carries
-  `(literal run length, match length - minmatch)` pairs; their sum is the original size.
-  * VERIFIED byte exact: re-running the LZ77 over the plaintext of a stored twin
-    reproduces the archive's stream B byte for byte and the number of literals equals
-    `v7` (3 archives: dgca100, dgca110, dgca-beta1 - `minlen = 1<<6`, model shift 4).
+  `(literal run length, match length - minmatch) pairs; their sum is the original size.
+* **LZ stage / chain walk** - the LZ stage is a *permutation* of its input; the decoder inverts
+  it with the chain walk (`sub_428990`): the histogram of the token buffer -> the exclusive
+  prefix sums -> `Block[cnt[src[i]]++] = i` -> `dest[k] = src[Block^k(start)]`, where
+  **`start` = the block's `v22`** (the payload's +0x10).
+* **Column method** (`tag 2` blocks) - the data is split into `stride` interleaved columns
+  (column k = the bytes at k, k+stride, ...), every column is delta transformed (the order =
+  the flags' bits 16..19) and compressed as its own tag 1 block; the decoder inverts the delta
+  and de-interleaves the columns.
 * **Block header** - `size` = the *original* size, `v7` = the size fed to the entropy coder
   (= the size of the pre-transform's output, the literal bytes). (Easy to mix up; `v7` is
   what the decoder must produce from stream A.)
-* **Pipeline order** (from the disassembly of `sub_425600` / `sub_425A50`):
-  encode = `[LZ stage] -> [pre-transform] -> [entropy]`, decode =
-  `[entropy] -> [chain walk] -> [inverse pre-transform]`.
-* **Chain walk** (`sub_428990`, fully known): histogram -> prefix sums ->
-  `Block[cnt[src[i]]++] = i` -> `dest[k] = src[Block^k(start)]`; the start index is
-  `*(u32*)arg_C` (arg_C is a *pointer*).
-* **The LZ stage is a PURE PERMUTATION** (`sub_428270` builds an index array and copies
-  the bytes unchanged) - so the token stream must have the same byte histogram as the
-  literals.  The earlier "it also applies a delta" note was WRONG.
 
-**Still open:**
+*Proof*: the encoder in `cm.py` (scratch dir) re-encodes the real stream A byte for byte,
+and `dgcunp.c` extracts every archive in the work area with all the file CRCs matching
+the index (including `names.dgc` with 5981 entries and a compressed index + name list).
 
-* **The entropy decoder still produces wrong bytes.**  The re-encode test
-  (`encode(decode(A)) == A`) is only a self-consistency test and cannot see this; the
-  real oracle is the **histogram**: the token stream must have the same byte histogram
-  as the literals (which are known exactly).  It currently fails.
-  * The bug is in the **prepare/restore passes** of the CM coder (the run symbol is off
-    by the same kind of error as the literal model), and it is *not* a single toggle:
-    a search over 4608 combinations (prepare/restore direction, scale chain, chain
-    byte, pair/run model bases, value assembly, initial previous byte) satisfies at
-    most one of the three regression cases.
-  * **The three regression cases** are the way in: `tiny\twoblk.dgc` (the token stream
-    must be "AAAAAA"), `tiny\ab1000.dgc` ("ABAB") and `tiny\abc1000.dgc` ("ABCAB") -
-    tiny archives made with `dgcac` from 1000 byte files; the pre-transform's model
-    says exactly what the token stream has to be, and each decode is a pass/fail in
-    about a millisecond.
-  * **The end-to-end test** (e2e.py in the scratch dir) is the strongest oracle:
-    decoded token stream -> chain walk (over every start index) -> inverse
-    pre-transform -> compare with the original file.  It validates the token stream,
-    the chain walk's start index and the LZ77's inverse at once.  It is the test
-    that will finally settle the LZ stage.
-  * Two near misses: the scale chain `0x2000, node0*128, node1*128, ...` with the
-    initial previous byte `0xFF` decodes `twoblk` exactly, and the prepare's direction
-    flipped (the same as the restore's) with the disassembly's scale chain and the
-    initial previous byte `0` decodes `ab1000` exactly ("BBAA").
-* **The chain walk's start index** - the normal path passes the destination buffer as
-  `arg_C` (which would read uninitialised memory), the column path passes the block
-  header.  The start index has to be found (v22, the block header's +0x10, is a candidate).
-* **Solid mode "column" method** (method A) - flags bit 2, delta order in bits 16..31.
-  Sizes come out right, content is wrong.
-* **Encryption** (`-p` / `-k`) is fully specified in `NOTES-dgca-format.md` section 8 (the
-  cipher, the SHA-512/MT19937 key derivation and exactly what gets encrypted) but is not
-  implemented in `dgcunp.c` yet. A ready-made test pair: `dgcac a plain.dgc src` vs
-  `dgcac a -p secret enc.dgc src` differ only at the chunk header CRC fields and in the
-  `DGCC` chunk.
+The traps that cost the most time (do not repeat them):
 
----
+* the decoder's argument list is NOT the encoder's: in `sub_427260` the chain of the
+  prepare/restore passes is **arg_20 = the previous byte** and arg_1C is p_ctx;
+* the prepare pass's scale chain is the **delta** chain, not the node chain;
+* the restore pass walks the previous byte's tree **from the deepest node up**;
+* the gamma decoder returns the **level** for the levels 0 and 1;
+* the initial previous byte is 0xFF if the params' bit 0 is set (the opposite way round
+  desynchronises the coder);
+* the IFDT blob of a compressed archive differs from the blob of the stored twin (the
+  "compressed size" field) - comparing the two is a false oracle.
+
+Still open: the match coder (`sub_427D60` / `sub_427640`, the params' bit 1 - not used by
+any of the sample archives) and the encryption.
+
 
 ## 5. Build & test the unpacker
 
@@ -230,12 +202,25 @@ Current state of `dgcunp.c`:
 | area | status |
 |---|---|
 | chunk tree, both CRC-32s | working |
-| `IARC`, `IFDT` (stored form), `IFNM` | working |
+| `IARC`, `IFDT` (stored **and** compressed), `IFNM` (stored **and** compressed) | working |
 | extract, stored archives | working - files byte-identical to the originals |
-| compressed data, each-file mode | working - decoded data area CRC matches the archive |
-| compressed index | blocked on the LZ stage (section 4) |
-| solid mode | sizes right, content wrong |
+| extract, compressed archives (all modes) | working - every file's CRC-32 matches the index |
+| solid mode / the column method | working |
+| long UTF-8 names (> MAX_PATH) | working - the wide APIs with the `\\?\` prefix |
 | encrypted archives | not implemented |
+| the match coder (the params' bit 1) | not implemented (unused by the sample archives) |
+
+The regression test: extract every archive in the work area and check that
+every file's CRC-32 matches the index:
+
+```powershell
+foreach ($a in Get-ChildItem *.dgc, *.dgcr) {
+    & dgcunp.exe -o out\$($a.Name) $a.FullName | Select-String 'MISMATCH|cannot create|could not be'
+}
+```
+
+Nothing may be printed (the `names.dgc` archive has 5981 entries with Japanese
+file names, so the extraction takes a moment).
 
 ---
 
@@ -270,8 +255,9 @@ Three bugs that cost real time and are worth remembering:
 * the decompiled `sym()`/symbol decoder **loses a `break`** in one branch if you transcribe
   it carelessly, which turns a 2-level symbol into a 32-level runaway and desynchronises
   everything downstream;
-* the CM coder's prepare pass **overwrites its own scale register** with the node value, so
-  the scale chain is `0x2000, node0, node1, ...` and not the running product.
+* the CM coder's prepare pass **keeps the node in the scale register** (`mov ecx, eax`)
+  but only uses it for the next bit - the scale of the next level is the *delta* of the
+  current level (`0x2000, delta0, delta1, ...`), not the node and not the product.
 
 ---
 
