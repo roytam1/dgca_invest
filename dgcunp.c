@@ -973,8 +973,10 @@ int main(int argc, char **argv)
                (unsigned)(u32)rd64(iarcpay + 0x28), (unsigned)(u32)rd64(iarcpay + 0x30),
                (unsigned)(u32)rd64(iarcpay + 0x38), rd32(iarcpay + 0x40));
         if (rd32(iarcpay) & 1) {
-            printf("\n*** this archive is ENCRYPTED (-p / -k) - the decryption is not\n"
-                   "    implemented yet, so nothing can be extracted.\n");
+            printf("\n*** this archive is ENCRYPTED (-p / -k).\n"
+                   "    Note: dgcac v1.10 cannot decrypt its own encrypted archives\n"
+                   "    (the writer and the reader derive different keys and the key\n"
+                   "    material is never written), so the data cannot be recovered.\n");
             return 1;
         }
     } else {
