@@ -302,20 +302,34 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
 
   7.1  WHAT THE RECOVERY DATA IS
   ------------------------------
-  It is NOT only a checksum: the INFO's +0x2C is the CRC-32 of the whole
-  archive (the bytes in front of the DGCR chunk) - that is the integrity
-  check the tool's "dgcac k" performs (sub_422480 compares
+  It is NOT only a checksum: the INFO's +0x2C is the CRC-32 (zlib) of the
+  whole archive (the bytes in front of the DGCR chunk) - that is the
+  integrity check the tool's "dgcac k" performs (sub_422480 compares
   crc32(data) with the stored value).
 
-  The DATA chunk holds a PARITY table, built by sub_422F20:
-      for every (row, column) the XOR of the archive's 4 byte words over
-      the "pages" (the archive is seen as a matrix of
-      rows x 256 columns x pages words, the words being read in the
-      natural order).  It is a RAID-4 style redundancy: it can restore a
-      lost 4 byte word, and for a one page archive (the usual case for a
-      small archive) the table degenerates into a full copy of the
-      archive's data.  The redundancy ratio is 1/pages, which is what
-      the -r level selects (level 9 = 100%).
+  The DATA chunk holds a PARITY table, built by the writer (the three
+  buffers "v340/v339/Block"):
+      the archive is seen as a matrix of  pages x rows x 256 columns
+      4 byte words (the matrix is padded with zeros if the archive is
+      shorter than rows*256*pages words)
+      part 1 (rows*256 words): for every (row, column) the XOR of the
+              words of all the pages
+      part 2 (pages*rows words): for every (page, row) the XOR of the
+              words of all the columns
+      part 3 (rows words): the offsets of the row blocks (the tool puts
+              a copy of the data into a "DGCD" chunk that it builds in
+              memory, and these are the offsets in it)
+  It is a RAID-4 style redundancy: it can restore a lost 4 byte word,
+  and for a one page archive (the usual case for a small archive) the
+  table degenerates into a full copy of the archive's data.  The
+  redundancy ratio is 1/pages, which is what the -r level selects
+  (level 9 = 100%).
+
+  The recovery data is encrypted with the SecureCryptograph class (see
+  section 8) with the FIXED key: the password "SecureCryptograph" and an
+  8 byte block of zeros.  The three parts are encrypted one after the
+  other with the same cipher object, so the key stream runs over the
+  whole recovery data.
 
   MEASURED: two archives of the same size but different content have
   1019 of the 1032 recovery bytes different (the first 8 bytes are a
@@ -323,13 +337,20 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
   first 8 bytes - so the table is a scrambled (encrypted) function of
   the archive's content.
 
-  The table is not stored raw: after the parity pass the generator runs a
-  differential pass (the "k = 1 .. 2*pages-1" loop of sub_422F20, which
-  stores the rotated XOR of the neighbouring words) and then the base
-  SecureCryptograph class's cipher.  To use the table for a repair one
-  has to reverse those two steps.
+  (The "differential pass" that the old notes mentioned was the GUI's
+  variant of the generator - the CLI's writer stores the plain table,
+  encrypted.)
 
-  7.2  WHAT THE TOOL DOES WITH IT
+  7.2  THE REPAIR (what dgcunp -R does)
+  --------------------------------------
+  The parity table is a 2 dimensional parity code: the column parity
+  (part 1) locates the damaged columns and the row parity (part 2) the
+  damaged words.  For every column whose parity does not match, the
+  damaged word is the parity XOR the other words of the column; the row
+  parity tells which page of the column is the damaged one.  The final
+  check is the CRC-32 of the archive (the INFO's +0x2C).
+
+  7.3  WHAT THE TOOL DOES WITH IT
   -------------------------------
   Nothing.  Tested with a partly zeroed copy of dgca110-rec.dgcr:
       dgcac k   -> "Check process failed."  (it detects the damage)
@@ -338,14 +359,18 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       neither command rewrites the file (checked byte for byte)
   So the v1.10 tool writes the recovery data but never repairs with it;
   it only uses the CRC in the INFO.  dgcunp.c does the same: it verifies
-  the recovery checksum and reports "the archive is DAMAGED", but it does
-  not repair.
+  the recovery checksum and reports "the archive is DAMAGED", and with
+  -R it repairs the archive and writes "<archive>.repaired".
 
 
 8. ENCRYPTION (-p password / -k keyfile)
 ----------------------------------------
-  NOT IMPLEMENTED in dgcunp.c yet (it detects an encrypted archive and says
-  so).  The following is the state of the analysis (2026-10-22).
+  The CRYPTO IS NOW CRACKED (2026-10-22) and implemented in dgcunp.c
+  (the SHA-512, the MT19937 variant, the PRNG, the cipher and the key
+  derivation are byte exact - VERIFIED against the original binary, see
+  section 8.6).  What is still missing is the KEY MATERIAL that the
+  writer derives (section 8.7), so an encrypted archive cannot be
+  decrypted yet.
 
   Cipher (sub_421C30 encrypt / sub_421C80 decrypt), a self inverse XOR
   stream with one feedback byte:
@@ -379,6 +404,14 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       NOT used here.  The first 64 prng calls (the first 32 data bytes)
       re-derive the key buffer for every single byte.
 
+      TRAP: the 64 byte "scratch" buffer at this+0x1500 OVERLAPS the
+      upper half of the 128 byte rolling state at this+0x14C0 (0x1500 =
+      0x14C0 + 0x40)!  So the feedback bytes are stored TWICE in the
+      rolling state: the bytes 0..63 and the bytes 64..127 hold the
+      same values.  The hash of the rolling state therefore sees every
+      feedback byte twice.  (Getting this wrong breaks the key stream
+      from the 3rd prng call on - the first 32 data bytes still match.)
+
   8.2  THE KEY DERIVATION (sub_421CF0) - the C code is the reference
   -----------------------------------------------------------------
       void __thiscall sub_421CF0(this, a2, Block, a4..a10)
@@ -403,6 +436,11 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       [0xFFFFFFFF] + the history's dwords 0..622 (623 dwords) - the
       0xFFFFFFFF is the dword in front of the history, NOT a prefix of the
       history itself.
+      Note that the hash is NOT reset after the 39 rounds in the
+      derivation: sub_421CF0 ends with the hash's init (the vtable
+      entry +0x4 = sub_4200D0), so the PRNG's hash starts from the
+      initial state again.
+
 
       The string is an MSVC std::string passed by value: a7 = its size,
       a8 = its capacity, Block = its data (or the inline buffer).
@@ -420,54 +458,32 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       The seeding is NOT the standard init_by_array:
           for i in 0..623: state[i] = key[i % key_length]
           twist()
-      The twist is the standard MT19937 twist, but the TEMPERING is applied
-      to the state during the twist (a "tempered state" variant); the
-      output (sub_426EC0) returns the raw state word.  The first 32 words
-      after the seeding are therefore the same as the standard MT19937's
-      first 32 outputs; from the second twist on the two differ.  The twist
-      is chosen by a CPUID check (sub_426980): with MMX/SSE the MMX version
-      (sub_426B30), otherwise the scalar one (sub_4269E0).
+      The twist is the standard MT19937 twist (the MMX version
+      sub_426B30 and the scalar one sub_4269E0 compute the same thing;
+      the CPUID check sub_426980 picks the MMX one).  The tempering is
+      NOT applied to the state: the twist copies the tempered words
+      into a separate output array (the MT object + 0x9C8) and
+      sub_426EC0 returns the words of that array.  The state array
+      (the MT object + 4) therefore keeps the untempered values and
+      the output sequence is the same as the standard MT19937's.
 
-    8.4  THE CLI'S ENCRYPTION IS BROKEN - THE GUI'S WORKS
-  ------------------------------------------------------
-  The GUI version (dgca.exe, in the work area root) has the SAME crypto
-  library (the same setKey = sub_46A610, the same MT19937, the same
-  SHA-512) and the same writer code (sub_451A90: v41 = 96, v40 = v57).
-  The difference is in the READER:
+  8.4  THE SHA-512 (the binary's own word order)
+  -----------------------------------------------
+      The hash is the standard SHA-512 with ONE difference: when the
+      transform loads the message, every 8 byte group is byte
+      reversed (the code does a bswap32 of both dwords and swaps
+      them).  The state and the K constants are the standard ones
+      (the IV at this[2..17] is the standard H0..H7 with the low
+      dword first) and getState (sub_4201F0) returns the 64 raw
+      bytes of the state, i.e. every 64 bit word with its low dword
+      first (which is the byte reversed digest).
 
-      CLI  (sub_40FDB0):  sub_421CF0(..., this[122], 32)   <- 32 bytes!
-      GUI  (sub_452490):  sub_46A610(..., lpBuffer, 96)     <- 96 bytes
+      VERIFIED: the getState of SHA-512("abc") is
+      ba7a6193a135afdd314120ae497341cca27ea9894efae6129ad3554be6ee9e0a
+      a8c14f272a999221bdebfea3233cba360ee83c6423444d459fa44ca54fc99a2a
+      (the same as the standard digest, byte reversed per 8 byte group).
 
-  and in where the key material comes from: the GUI reads it from the
-  file -
-      v19 = sub_442D20(stream, lpBuffer, 0x60);   // 96 bytes!
-      if (v19 != 96) -> "read error"
-  - from the "DGCD" chunk (the one the CLI creates but never writes).
-
-  The GUI's reader (sub_452490) in full:
-      read 96 bytes -> lpBuffer                    (the key material)
-      read 32 bytes -> a3                         (the data)
-      if (lpBuffer[0] & 1) {                      // encrypted
-          setKey-and-verify(the password);
-          "decrypt"(lpBuffer + 4, 92);             // the check data
-          if (lpBuffer[3]) -> "wrong password";
-          setKey(lpBuffer, 96);                   // the real key
-          "decrypt"(a3, 32);
-      }
-
-  => to decrypt an archive made by the GUI one needs its 96 byte
-  material block (the DGCD chunk) and the password; the key is
-  SHA-512(material || password) stretched over 39 rounds and seeded into
-  the MT19937 exactly as in 8.2/8.3.
-
-  The CLI's own encrypted archives are unrecoverable: the writer and the
-  reader derive DIFFERENT keys and the material is never written.
-  MEASURED: "dgcac a -pmypass e.dgc f.bin" followed by
-  "dgcac e -pmypass out e.dgc" prints "Extraction process failed." - with
-  the RIGHT password (and the same with a wrong one: the password is not
-  even checked).  The GUI's version of the same archive works.
-
-    8.5  SCOPE (measured by diffing an encrypted and a plain archive)
+  8.5  SCOPE (measured by diffing an encrypted and a plain archive)
   ----------------------------------------------------------------
       * the whole DGCC chunk (the 32 byte header + the payload) is encrypted
         as ONE unit - the chunk's ID and its size are encrypted too, so the
@@ -484,16 +500,75 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
   `dgcac a -p secret enc.dgc src` - the two files differ only at the chunk
   header CRC fields and in the DGCC chunk.
 
+  8.6  THE VERIFICATION OF THE CRYPTO
+  -----------------------------------
+      The implementation in dgcunp.c is byte exact.  It was verified
+      against the original binary by calling its own functions
+      (dgcac.exe has no relocations, so it has to be mapped at
+      0x400000; a helper DLL was injected into a running dgcac.exe to
+      do that):
+        - the getState of SHA-512("abc")   (the SHA-512)
+        - the MT19937's output of the seed 0..623
+        - the key stream of the fixed key (the password
+          "SecureCryptograph" and 8 zero bytes):
+          590661c76a2ad275dd11187646cd059ede7a6c1e36db71e6a7b326b083c2b60
+          3350b64663ba46dbf9f77f88b528bc9d29927441709033aad5da5cbf58030f470
+      and against the real data: the recovery table of a .dgcr file
+      decrypts to the archive's bytes (see section 7).
+
+  8.7  WHAT IS STILL MISSING: THE KEY MATERIAL
+  --------------------------------------------
+      The writer derives a 96 byte key material (the "Buffer" of
+      sub_40AE90, built at 0x40B64D and 0x40CCBE) and uses it as the
+      first half of the key derivation:
+          key = SHA-512(material || password) stretched over 39 rounds
+      The material is (the offsets are into the 96 bytes):
+          +0x00  the flags (1 = encrypted)
+          +0x04  the high dword of a block count
+          +0x08  the low dword of the block count
+          +0x0C  0
+          +0x10  the high dword of B (max(the file size, the divisor))
+          +0x14  the low dword of B
+          +0x18  the low dword of the file size
+          +0x1C  the high dword of the file size
+          +0x20  64 bytes: the SHA-512 state of some file
+      The last 64 bytes are filled by the object's vtable entry +0x18
+      (a "hash a file" function) - the name of the file it hashes comes
+      from an UNINITIALISED stack slot of the writer (the buffer that
+      receives the hash is passed to it as a std::string), so it is the
+      leftover of an earlier call.  In the -k mode it is the key file
+      (MEASURED: two key files with the same content but different
+      names give the same key stream), in the -p mode it is a file with
+      an empty content (the same key stream for every archive).
+
+      The reader (sub_40FDB0) uses the first 32 bytes of the DECRYPTED
+      chunk header as the material - which is not what the writer
+      does.  That is the bug of the CLI: the writer and the reader
+      derive different keys, and the password is never checked (the
+      check flag is never set).
+
+      => to decrypt an archive one needs the 96 byte material.  The
+      crypto is known, the material's derivation is not (yet).
+
+
 9. TOOL
 -------
-  dgcunp.c   MSVC6, C89.  -l list, -v verbose, -o outdir extract.
+  dgcunp.c   MSVC6, C89.  -l list, -v verbose, -R repair, -o outdir
+  extract, -t the crypto's self test.
   works: container parse, CRC verify, IARC, the index (stored AND
          compressed), the name list (stored AND compressed), the data area
          (stored, compressed, solid and the column method) - every
          extracted file is verified against the CRC-32 of the index.
   The extraction uses the wide APIs with the "\\?\" prefix, so long UTF-8
   names (> MAX_PATH) work.
-  open: the encryption (-p / -k) and the match coder (the params' bit 1).
+  works: the crypto of DGCA v1.10 (the SHA-512, the MT19937 variant, the
+         PRNG, the cipher and the key derivation - byte exact, see
+         section 8) and the recovery data: -R decodes the DGCR chunk,
+         repairs the damaged words with the parity table and writes
+         "<archive>.repaired".
+  open: the encryption of the archives (-p / -k): the crypto is known
+        but the key material that the writer derives is not (8.7), and
+        the match coder (the params' bit 1).
 
 10. VERIFICATION
 ---------------
@@ -504,6 +579,16 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       every m_*.dgc / t*.dgc / c_*.dgc / n_*.dgc test archive
   The Python reference implementation (cm.py in the scratch dir) reproduces
   the same bytes.
+
+  The crypto (section 8) is verified against the original binary: the
+  getState of SHA-512("abc"), the MT19937's output and the key stream of
+  the fixed key are byte exact, and the recovery data of the .dgcr files
+  decrypts to the archive's bytes.
+
+  The repair (section 7.2) is verified: a .dgcr file with three
+  damaged words is repaired by "dgcunp -R" and the archive's CRC-32
+  matches the one in the INFO chunk again; the repaired archive is
+  extracted without a single error.
 
 11. HOW THE CODEC WAS CRACKED (the traps)
 -----------------------------------------
@@ -526,4 +611,8 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
     stored twin (the "compressed size" and "offset" fields) - comparing
     the two is a false oracle.
   * The chain walk's start index is the block's v22 (the payload's +0x10).
+  * The crypto's "scratch" buffer overlaps the upper half of the rolling
+    state, so the feedback bytes are hashed twice (section 8.1).
+  * The binary's SHA-512 reverses every 8 byte group of the message
+    (section 8.4) - a plain SHA-512 gives a different key stream.
 

@@ -7,8 +7,9 @@ Workarea for reverse engineering **DGCA / DGC Archiver v1.10** by SYN (Shin-ichi
 dgcac.exe        the target (Win32 console, MSVC6, 2006-08-07)
 dgcac.exe.lst    IDA disassembly listing (~5.3 MB)
 dgcac.exe.c      Hex-Rays decompiled C (~1.0 MB, 462 functions)
-NOTES-dgca-format.md   full format + codec specification
-dgcunp.c         unpacker / lister written from this analysis (MSVC6, C89)
+dgcunp.c         unpacker / lister / repair tool written from this analysis
+                 (MSVC6, C89)
+NOTES-dgca-format.md   full format + codec + crypto specification
 ```
 
 Everything in `NOTES-dgca-format.md` is **verified against bytes produced by the tool
@@ -192,6 +193,8 @@ copy the `.exe` back, or map a drive letter first.)
 dgcunp.exe -v archive.dgc            # dump the chunk tree + CRC status
 dgcunp.exe archive.dgc                # list the entries
 dgcunp.exe -o outdir archive.dgc      # extract
+dgcunp.exe -R archive.dgcr           # repair it with its recovery data
+dgcunp.exe -t                        # the crypto's self test
 ```
 
 **Verification is the CRC-32 stored in the index**: every entry carries the CRC-32 of the
@@ -207,7 +210,9 @@ Current state of `dgcunp.c`:
 | extract, compressed archives (all modes) | working - every file's CRC-32 matches the index |
 | solid mode / the column method | working |
 | long UTF-8 names (> MAX_PATH) | working - the wide APIs with the `\\?\` prefix |
-| encrypted archives | not implemented |
+| the crypto of DGCA v1.10 (SHA-512, MT19937, PRNG, cipher, key derivation) | working - byte exact, verified against the original binary |
+| the recovery data (`-R`): the parity table, the repair, the archive's CRC-32 | working - a damaged `.dgcr` is repaired and extracted without errors |
+| encrypted archives | the crypto is known, the key material that the writer derives is not (see `NOTES-dgca-format.md` 8.7) |
 | the match coder (the params' bit 1) | not implemented (unused by the sample archives) |
 
 The regression test: extract every archive in the work area and check that

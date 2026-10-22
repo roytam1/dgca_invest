@@ -805,17 +805,354 @@ static void parse_names(chunk_t *ifnm)
  * The DGCR chunk is appended after the DGCA chunk.  Its INFO chunk holds
  * the recovery parameters and, at +0x2C, the CRC-32 of the whole archive
  * (i.e. of everything in front of the DGCR chunk) - that is what the
- * tool's "dgcac k" command verifies. */
-static void check_recovery(chunk_t *dgcr)
+ * tool's "dgcac k" command verifies.  (the functions that decode and
+ * repair it are further down, next to the crypto) */
+
+/* ------------------------------------------------------------------ *
+ *  The crypto of DGCA v1.10 (the "SecureCryptograph" class)
+ *
+ *  It is a self inverse XOR stream:
+ *      encrypt: in=buf[i]; k1=prng(); k2=prng();
+ *               buf[i] = in^k1^k2 ;  feedback = in^k1
+ *      decrypt: in=buf[i]; k1=prng(); k2=prng();
+ *               buf[i] = in^k1^k2 ;  feedback = in^k2
+ *  The key stream comes from a SHA-512 that is stretched over 39 rounds
+ *  and used to seed a MT19937 variant.  The SHA-512 of the binary keeps
+ *  the standard state and the standard K constants, but every 8 byte
+ *  group of the message is byte reversed when it is loaded.
+ * ------------------------------------------------------------------ */
+typedef unsigned __int64 u64x;
+
+static const u64x sha512_k[80] = {
+    0x428A2F98D728AE22UI64, 0x7137449123EF65CDUI64, 0xB5C0FBCFEC4D3B2FUI64,
+    0xE9B5DBA58189DBBCUI64, 0x3956C25BF348B538UI64, 0x59F111F1B605D019UI64,
+    0x923F82A4AF194F9BUI64, 0xAB1C5ED5DA6D8118UI64, 0xD807AA98A3030242UI64,
+    0x12835B0145706FBEUI64, 0x243185BE4EE4B28CUI64, 0x550C7DC3D5FFB4E2UI64,
+    0x72BE5D74F27B896FUI64, 0x80DEB1FE3B1696B1UI64, 0x9BDC06A725C71235UI64,
+    0xC19BF174CF692694UI64, 0xE49B69C19EF14AD2UI64, 0xEFBE4786384F25E3UI64,
+    0x0FC19DC68B8CD5B5UI64, 0x240CA1CC77AC9C65UI64, 0x2DE92C6F592B0275UI64,
+    0x4A7484AA6EA6E483UI64, 0x5CB0A9DCBD41FBD4UI64, 0x76F988DA831153B5UI64,
+    0x983E5152EE66DFABUI64, 0xA831C66D2DB43210UI64, 0xB00327C898FB213FUI64,
+    0xBF597FC7BEEF0EE4UI64, 0xC6E00BF33DA88FC2UI64, 0xD5A79147930AA725UI64,
+    0x06CA6351E003826FUI64, 0x142929670A0E6E70UI64, 0x27B70A8546D22FFCUI64,
+    0x2E1B21385C26C926UI64, 0x4D2C6DFC5AC42AEDUI64, 0x53380D139D95B3DFUI64,
+    0x650A73548BAF63DEUI64, 0x766A0ABB3C77B2A8UI64, 0x81C2C92E47EDAEE6UI64,
+    0x92722C851482353BUI64, 0xA2BFE8A14CF10364UI64, 0xA81A664BBC423001UI64,
+    0xC24B8B70D0F89791UI64, 0xC76C51A30654BE30UI64, 0xD192E819D6EF5218UI64,
+    0xD69906245565A910UI64, 0xF40E35855771202AUI64, 0x106AA07032BBD1B8UI64,
+    0x19A4C116B8D2D0C8UI64, 0x1E376C085141AB53UI64, 0x2748774CDF8EEB99UI64,
+    0x34B0BCB5E19B48A8UI64, 0x391C0CB3C5C95A63UI64, 0x4ED8AA4AE3418ACBUI64,
+    0x5B9CCA4F7763E373UI64, 0x682E6FF3D6B2B8A3UI64, 0x748F82EE5DEFB2FCUI64,
+    0x78A5636F43172F60UI64, 0x84C87814A1F0AB72UI64, 0x8CC702081A6439ECUI64,
+    0x90BEFFFA23631E28UI64, 0xA4506CEBDE82BDE9UI64, 0xBEF9A3F7B2C67915UI64,
+    0xC67178F2E372532BUI64, 0xCA273ECEEA26619CUI64, 0xD186B8C721C0C207UI64,
+    0xEADA7DD6CDE0EB1EUI64, 0xF57D4F7FEE6ED178UI64, 0x06F067AA72176FBAUI64,
+    0x0A637DC5A2C898A6UI64, 0x113F9804BEF90DAEUI64, 0x1B710B35131C471BUI64,
+    0x28DB77F523047D84UI64, 0x32CAAB7B40C72493UI64, 0x3C9EBE0A15C9BEBCUI64,
+    0x431D67C49C100D4CUI64, 0x4CC5D4BECB3E42B6UI64, 0x597F299CFC657E2AUI64,
+    0x5FCB6FAB3AD6FAECUI64, 0x6C44198C4A475817UI64
+};
+static const u64x sha512_iv[8] = {
+    0x6A09E667F3BCC908UI64, 0xBB67AE8584CAA73BUI64, 0x3C6EF372FE94F82BUI64,
+    0xA54FF53A5F1D36F1UI64, 0x510E527FADE682D1UI64, 0x9B05688C2B3E6C1FUI64,
+    0x1F83D9ABFB41BD6BUI64, 0x5BE0CD19137E2179UI64
+};
+
+typedef struct {
+    u64x h[8];
+    u8   buf[128];
+    u32  idx;
+    u64x bits;      /* the low 64 bits of the message length in bits */
+    u64x bitshi;    /* the high 64 bits */
+} sha512_t;
+
+static u64x rotr64(u64x x, int n) { return (x >> n) | (x << (64 - n)); }
+static u64x be64(const u8 *p)
 {
-    chunk_t *info = child_chunk(dgcr, "INFO");
+    return ((u64x)p[0] << 56) | ((u64x)p[1] << 48) | ((u64x)p[2] << 40) |
+           ((u64x)p[3] << 32) | ((u64x)p[4] << 24) | ((u64x)p[5] << 16) |
+           ((u64x)p[6] << 8) | (u64x)p[7];
+}
+static void put64le(u8 *p, u64x v)
+{
+    p[0] = (u8)v;         p[1] = (u8)(v >> 8);  p[2] = (u8)(v >> 16);
+    p[3] = (u8)(v >> 24); p[4] = (u8)(v >> 32); p[5] = (u8)(v >> 40);
+    p[6] = (u8)(v >> 48); p[7] = (u8)(v >> 56);
+}
+
+static void sha512_compress(sha512_t *s, const u8 *block)
+{
+    u64x w[80], a, b, c, d, e, f, g, h, t1, t2;
+    int i;
+    for (i = 0; i < 16; i++) w[i] = be64(block + i * 8);
+    for (i = 16; i < 80; i++) {
+        u64x x = w[i - 15], y = w[i - 2];
+        u64x s0 = rotr64(x, 1) ^ rotr64(x, 8) ^ (x >> 7);
+        u64x s1 = rotr64(y, 19) ^ rotr64(y, 61) ^ (y >> 6);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    a = s->h[0]; b = s->h[1]; c = s->h[2]; d = s->h[3];
+    e = s->h[4]; f = s->h[5]; g = s->h[6]; h = s->h[7];
+    for (i = 0; i < 80; i++) {
+        t1 = h + (rotr64(e, 14) ^ rotr64(e, 18) ^ rotr64(e, 41)) +
+             ((e & f) ^ ((~e) & g)) + sha512_k[i] + w[i];
+        t2 = (rotr64(a, 28) ^ rotr64(a, 34) ^ rotr64(a, 39)) +
+             ((a & b) ^ (a & c) ^ (b & c));
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    s->h[0] += a; s->h[1] += b; s->h[2] += c; s->h[3] += d;
+    s->h[4] += e; s->h[5] += f; s->h[6] += g; s->h[7] += h;
+}
+
+static void sha512_init(sha512_t *s)
+{
+    memcpy(s->h, sha512_iv, sizeof(sha512_iv));
+    s->idx = 0;
+    s->bits = 0;
+    s->bitshi = 0;
+}
+
+static void sha512_update(sha512_t *s, const u8 *data, u32 n)
+{
+    {
+        u64x old = s->bits;
+        s->bits += (u64x)n * 8;
+        if (s->bits < old) s->bitshi++;
+    }
+    while (n) {
+        u32 k = 128 - s->idx;
+        if (k > n) k = n;
+        memcpy(s->buf + s->idx, data, k);
+        s->idx += k;
+        data += k;
+        n -= k;
+        if (s->idx == 128) { sha512_compress(s, s->buf); s->idx = 0; }
+    }
+}
+
+static void sha512_final(sha512_t *s)
+{
+    u64x bits = s->bits, bitshi = s->bitshi;
+    u8 pad[256];
+    u32 padlen;
+    int i;
+    memset(pad, 0, sizeof(pad));
+    pad[0] = 0x80;
+    padlen = (s->idx < 112) ? (112 - s->idx) : (240 - s->idx);
+    sha512_update(s, pad, padlen);
+    for (i = 0; i < 8; i++) pad[i] = (u8)(bitshi >> (56 - 8 * i));
+    sha512_update(s, pad, 8);
+    for (i = 0; i < 8; i++) pad[i] = (u8)(bits >> (56 - 8 * i));
+    sha512_update(s, pad, 8);
+    s->bits = bits;
+    s->bitshi = bitshi;
+}
+
+/* the 64 raw bytes of the state (as the binary's getState() returns them:
+ * the low dword of every 64 bit word comes first) */
+static void sha512_state(sha512_t *s, u8 *out)
+{
+    int i;
+    for (i = 0; i < 8; i++) put64le(out + i * 8, s->h[i]);
+}
+
+/* ---------------- the MT19937 variant of the binary ----------------
+ * The state is seeded directly (state[i] = key[i % len]), the twist is
+ * the standard MT19937 twist and the tempered words are copied into a
+ * separate output array (so the state keeps the untempered values). */
+typedef struct { u32 st[624], out[624]; u32 idx; } mt_t;
+
+static void mt_twist(mt_t *m)
+{
+    u32 *st = m->st;
+    int i;
+    for (i = 0; i < 624 - 397; i++) {
+        u32 y = (st[i] & 0x80000000u) | (st[i + 1] & 0x7FFFFFFFu);
+        st[i] = st[i + 397] ^ (y >> 1) ^ ((y & 1) ? 0x9908B0DFu : 0u);
+    }
+    for (; i < 623; i++) {
+        u32 y = (st[i] & 0x80000000u) | (st[i + 1] & 0x7FFFFFFFu);
+        st[i] = st[i + (397 - 624)] ^ (y >> 1) ^ ((y & 1) ? 0x9908B0DFu : 0u);
+    }
+    {
+        u32 y = (st[623] & 0x80000000u) | (st[0] & 0x7FFFFFFFu);
+        st[623] = st[396] ^ (y >> 1) ^ ((y & 1) ? 0x9908B0DFu : 0u);
+    }
+    for (i = 0; i < 624; i++) {
+        u32 y = st[i];
+        y ^= y >> 11;
+        y ^= (y << 7) & 0x9D2C5680u;
+        y ^= (y << 15) & 0xEFC60000u;
+        y ^= y >> 18;
+        m->out[i] = y;
+    }
+    m->idx = 0;
+}
+
+static void mt_init(mt_t *m, const u32 *seed)
+{
+    memcpy(m->st, seed, 624 * sizeof(u32));
+    m->idx = 624;
+    mt_twist(m);
+}
+
+static u32 mt_next(mt_t *m)
+{
+    if (m->idx >= 624) mt_twist(m);
+    return m->out[m->idx++];
+}
+
+/* ---------------- the SecureCryptograph object ---------------- */
+typedef struct {
+    sha512_t hash;
+    mt_t     mt;
+    u8       keybuf[64];
+    u8       rolling[128];
+    u32      index;
+    u32      counter;
+    u8       feedback;
+} crypt_t;
+
+/* the key derivation: SHA-512(material|password) stretched over 39 rounds
+ * and used to seed the MT19937 */
+static void crypt_setkey(crypt_t *c, const u8 *material, u32 matlen,
+                         const u8 *password, u32 pwlen)
+{
+    u8 hist[39 * 64], cur[64];
+    u32 seed[624];
+    int i;
+
+    sha512_init(&c->hash);
+    sha512_update(&c->hash, material, matlen);
+    sha512_update(&c->hash, password, pwlen);
+    sha512_final(&c->hash);
+    sha512_state(&c->hash, cur);
+    for (i = 0; i < 39; i++) {
+        memcpy(hist + i * 64, cur, 64);
+        sha512_update(&c->hash, cur, 64);
+        sha512_update(&c->hash, cur, 64);
+        sha512_state(&c->hash, cur);
+    }
+    seed[0] = 0xFFFFFFFFu;
+    for (i = 0; i < 623; i++) memcpy(&seed[1 + i], hist + i * 4, 4);
+    mt_init(&c->mt, seed);
+    sha512_init(&c->hash);              /* the hash is reset after the stretch */
+    memset(c->keybuf, 0, 64);
+    memset(c->rolling, 0, 128);
+    c->index = 0;
+    c->counter = 0;
+    c->feedback = 0;
+}
+
+static u8 crypt_prng(crypt_t *c)
+{
+    u8 fb, ret;
+    if (c->index == 0 || c->counter < 64) {
+        u8 tmp[128];
+        int i;
+        for (i = 0; i < 32; i++) {
+            u32 v = mt_next(&c->mt);
+            tmp[i * 4 + 0] = (u8)v;
+            tmp[i * 4 + 1] = (u8)(v >> 8);
+            tmp[i * 4 + 2] = (u8)(v >> 16);
+            tmp[i * 4 + 3] = (u8)(v >> 24);
+        }
+        sha512_update(&c->hash, tmp, 128);
+        sha512_update(&c->hash, c->rolling, 128);
+        sha512_state(&c->hash, c->keybuf);
+        if (c->counter < 64) c->counter++;
+    }
+    fb = c->feedback;
+    ret = (u8)(c->keybuf[c->index] ^ fb);
+    c->rolling[c->index] = fb;
+    c->rolling[64 + c->index] = fb;  /* the scratch overlaps the rolling */
+    c->feedback = 0;
+    c->index = (c->index + 1) & 0x3F;
+    return ret;
+}
+
+static void crypt_encrypt(crypt_t *c, u8 *buf, u32 n)
+{
+    u32 i;
+    for (i = 0; i < n; i++) {
+        u8 in = buf[i], k1, k2;
+        k1 = crypt_prng(c);
+        k2 = crypt_prng(c);
+        buf[i] = (u8)(in ^ k1 ^ k2);
+        c->feedback = (u8)(in ^ k1);
+    }
+}
+
+static void crypt_decrypt(crypt_t *c, u8 *buf, u32 n)
+{
+    u32 i;
+    for (i = 0; i < n; i++) {
+        u8 in = buf[i], k1, k2;
+        k1 = crypt_prng(c);
+        k2 = crypt_prng(c);
+        buf[i] = (u8)(in ^ k1 ^ k2);
+        c->feedback = (u8)(in ^ k2);
+    }
+}
+
+/* the key of the recovery data: the fixed password "SecureCryptograph"
+ * and an 8 byte block of zeros */
+static void crypt_setkey_fixed(crypt_t *c)
+{
+    static const u8 zero[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    crypt_setkey(c, zero, 8, (const u8 *)"SecureCryptograph", 17);
+}
+
+/* the self test: the key stream of the fixed key */
+static int crypto_selftest(void)
+{
+    crypt_t c;
+    sha512_t h;
+    u8 buf[64], st[64];
+    int i;
+    sha512_init(&h);
+    sha512_update(&h, (const u8 *)"abc", 3);
+    sha512_final(&h);
+    sha512_state(&h, st);
+    printf("sha512(\"abc\") = ");
+    for (i = 0; i < 64; i++) printf("%02x", st[i]);
+    printf("\n");
+    crypt_setkey_fixed(&c);
+    memset(buf, 0, sizeof(buf));
+    crypt_encrypt(&c, buf, 64);
+    for (i = 0; i < 64; i++) printf("%02x", buf[i]);
+    printf("\n");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ *
+ *  The recovery record (the DGCR chunk)
+ *
+ *  The DGCR chunk holds an INFO chunk (the parameters) and a DATA chunk
+ *  with the recovery data.  The data is a 2 dimensional parity code over
+ *  the archive's 4 byte words:
+ *      the archive = rows x 256 columns x pages words
+ *      part 1: the parity of the pages for every (row, column)
+ *      part 2: the parity of the columns for every (page, row)
+ *      part 3: the offsets of the row blocks (a copy of the data)
+ *  It is encrypted with the fixed key of the SecureCryptograph class.
+ * ------------------------------------------------------------------ */
+static void dgcr_report(chunk_t *dgcr, int verbose)
+{
+    chunk_t info;
     const u8 *ip;
-    u32 off, crc, c;
-    if (!info) { printf("recovery record: no INFO chunk\n"); return; }
-    if (info->psize < 0x30) { printf("recovery record: the INFO chunk is too small\n"); return; }
-    ip = g_img + info->off + 32;
+    u32 off, crc, c, len, cols, rows, pages;
+    info = *child_chunk(dgcr, "INFO");
+    if (!info.id[0]) { printf("recovery record: no INFO chunk\n"); return; }
+    if (info.psize < 0x30) { printf("recovery record: the INFO chunk is too small\n"); return; }
+    ip = g_img + info.off + 32;
     off = rd32(ip + 0x28);
     crc = rd32(ip + 0x2C);
+    len = rd32(ip + 4);
+    cols = rd32(ip + 0x10);
+    rows = rd32(ip + 0x14);
+    pages = rd32(ip + 0x18);
     if (off > g_imgsize) {
         printf("recovery record: the archive offset %u is outside the file\n", off);
         return;
@@ -823,8 +1160,119 @@ static void check_recovery(chunk_t *dgcr)
     c = crc32_buf(g_img, off);
     printf("recovery record: %u bytes, %u columns, %u rows, %u pages, "
            "the archive's checksum %08x %s\n",
-           rd32(ip + 4), rd32(ip + 0x10), rd32(ip + 0x14), rd32(ip + 0x18), c,
+           len, cols, rows, pages, c,
            c == crc ? "ok" : "MISMATCH - the archive is DAMAGED");
+    (void)verbose;
+}
+
+/* the repair: use the parity table to restore the damaged words.  The
+ * archive's checksum (in the INFO chunk) is the final check. */
+static int dgcr_repair(chunk_t *dgcr, const char *path, int verbose)
+{
+    chunk_t info, data;
+    const u8 *ip;
+    u8 *rec, *par, *rowx;
+    u32 off, crc, len, cols, rows, pages, i, j, k, fixed = 0, bad = 0, alen;
+    crypt_t c;
+
+    info = *child_chunk(dgcr, "INFO");
+    data = *child_chunk(dgcr, "DATA");
+    if (!info.id[0] || !data.id[0]) { printf("recovery record: incomplete\n"); return 0; }
+    if (info.psize < 0x30) { printf("recovery record: the INFO chunk is too small\n"); return 0; }
+    ip = g_img + info.off + 32;
+    off = rd32(ip + 0x28);
+    crc = rd32(ip + 0x2C);
+    len = rd32(ip + 4);
+    cols = rd32(ip + 0x10);
+    rows = rd32(ip + 0x14);
+    pages = rd32(ip + 0x18);
+    alen = off;
+    if (off > g_imgsize) { printf("the archive offset is outside the file\n"); return 0; }
+    if (data.psize < len || len < (rows * cols + pages * rows + rows) * 4) {
+        printf("the recovery data is too short\n");
+        return 0;
+    }
+    rec = (u8 *)malloc(len);
+    if (!rec) { printf("out of memory\n"); return 0; }
+    memcpy(rec, g_img + data.off + 32, len);
+    crypt_setkey_fixed(&c);
+    crypt_decrypt(&c, rec, len);
+    par  = rec;                        /* rows*cols words */
+    rowx = rec + rows * cols * 4;      /* pages*rows words */
+    /* the word of the archive: (page, row, column).  The matrix is padded
+     * with zeros if the archive is shorter than rows*cols*pages words. */
+#define ARCHWORD(pg, rw, cl) \
+    ((((pg) * rows + (rw)) * cols + (cl)) * 4 + 4 > alen ? 0u : \
+     rd32(g_img + (((pg) * rows + (rw)) * cols + (cl)) * 4))
+
+    /* 1. the columns whose parity does not match */
+    for (i = 0; i < rows; i++) {
+        for (j = 0; j < cols; j++) {
+            u32 x = 0;
+            for (k = 0; k < pages; k++) x ^= ARCHWORD(k, i, j);
+            if (x != rd32(par + (i * cols + j) * 4)) {
+                u32 cand = 0, kp = 0;
+                int found = 0;
+                /* try every page of the column: the damaged word must also
+                 * repair the row parity */
+                for (k = 0; k < pages; k++) {
+                    u32 y = 0, z, w;
+                    for (w = 0; w < pages; w++)
+                        if (w != k) y ^= ARCHWORD(w, i, j);
+                    cand = rd32(par + (i * cols + j) * 4) ^ y;
+                    /* does it repair the row parity of (k, i)? */
+                    z = 0;
+                    for (w = 0; w < cols; w++) {
+                        u32 ww = (w == j) ? cand : ARCHWORD(k, i, w);
+                        z ^= ww;
+                    }
+                    if (z == rd32(rowx + (k * rows + i) * 4)) {
+                        kp = k;
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found) {
+                    /* no page repairs the row parity (more than one word of
+                     * the row is damaged): take the most likely candidate */
+                    u32 y = 0, w;
+                    for (w = 1; w < pages; w++) y ^= ARCHWORD(w, i, j);
+                    cand = rd32(par + (i * cols + j) * 4) ^ y;
+                    kp = 0;
+                    bad++;
+                }
+                {
+                    u32 *p = (u32 *)(g_img + (((kp) * rows + (i)) * cols + (j)) * 4);
+                    *p = cand;
+                }
+                fixed++;
+            }
+        }
+    }
+#undef ARCHWORD
+    printf("the recovery: %u words restored, %u columns could not be verified\n",
+           fixed, bad);
+    {
+        u32 c2 = crc32_buf(g_img, off);
+        printf("the archive's checksum %08x %s\n", c2,
+               c2 == crc ? "ok - the archive is repaired" :
+               (bad ? "still damaged" : "MISMATCH"));
+        if (c2 == crc && crc) {
+            /* write the repaired archive next to the original */
+            char out[1024];
+            FILE *f;
+            sprintf(out, "%s.repaired", path);
+            f = fopen(out, "wb");
+            if (f) {
+                fwrite(g_img, 1, off, f);
+                fclose(f);
+                printf("the repaired archive was written to %s\n", out);
+            }
+        }
+    }
+    (void)verbose;
+    free(rec);
+    return (int)fixed;
 }
 
 /* ------------------- long / unicode paths -------------------
@@ -921,20 +1369,23 @@ static u8 *slurp(const char *path, u32 *size){
 static void usage(void)
 {
     printf("dgcunp - DGC archive unpacker / lister (format of DGCA v1.10)\n"
-           "usage: dgcunp [-v] [-l] [-o outdir] <archive.dgc>\n");
+           "usage: dgcunp [-v] [-l] [-R] [-o outdir] <archive.dgc>\n"
+           "  -R   repair a damaged archive with its recovery data (the DGCR chunk)\n");
     exit(1);
 }
 
 int main(int argc, char **argv)
 {
     const char *path = NULL, *outdir = NULL;
-    int verbose = 0, listonly = 0, i;
+    int verbose = 0, listonly = 0, repair = 0, i;
     chunk_t *info, *data, *ifdt, *ifnm, *iarc;
     const u8 *iarcpay;
 
+    if (argc > 1 && !strcmp(argv[1], "-t")) { crypto_selftest(); return 0; }
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-v")) verbose = 1;
         else if (!strcmp(argv[i], "-l")) listonly = 1;
+        else if (!strcmp(argv[i], "-R")) repair = 1;
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) outdir = argv[++i];
         else if (argv[i][0] == '-') usage();
         else path = argv[i];
@@ -974,9 +1425,9 @@ int main(int argc, char **argv)
                (unsigned)(u32)rd64(iarcpay + 0x38), rd32(iarcpay + 0x40));
         if (rd32(iarcpay) & 1) {
             printf("\n*** this archive is ENCRYPTED (-p / -k).\n"
-                   "    Note: dgcac v1.10 cannot decrypt its own encrypted archives\n"
-                   "    (the writer and the reader derive different keys and the key\n"
-                   "    material is never written), so the data cannot be recovered.\n");
+                   "    The crypto of DGCA v1.10 is known (see NOTES-dgca-format.md),\n"
+                   "    but the key material that the writer derives is not stored in the\n"
+                   "    archive, so the data cannot be decrypted yet.\n");
             return 1;
         }
     } else {
@@ -990,7 +1441,8 @@ int main(int argc, char **argv)
         chunk_t *dgcr = find_chunk("DGCR", 0);
         if (dgcr) {
             printf("\n");
-            check_recovery(dgcr);
+            dgcr_report(dgcr, verbose);
+            if (repair) dgcr_repair(dgcr, path, verbose);
         }
     }
 
