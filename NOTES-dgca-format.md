@@ -291,7 +291,7 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
 -------------------
   A "DGCR" chunk is appended after the DGCA chunk (extension .dgcr).
   DGCR payload = an INFO chunk (48 byte payload) + a DATA chunk with the
-  parity data.
+  recovery data.
   INFO payload: +0x00 = 0x43, +0x04 = recovery length, +0x10 = 256 cols,
   +0x14 = rows, +0x18 = pages, +0x28 = file offset of the DGCR chunk,
   +0x2C = checksum.
@@ -299,6 +299,48 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
   rows  = max(4, ceil(archivesize / ((256>>(level-1)) * 1024)))
   pages = ceil(archivesize / (rows*1024)); if pages == 1 rows = ceil(size/1024)
   VERIFIED for levels 1,5,9 on 100 byte .. 1 MB payloads.
+
+  7.1  WHAT THE RECOVERY DATA IS
+  ------------------------------
+  It is NOT only a checksum: the INFO's +0x2C is the CRC-32 of the whole
+  archive (the bytes in front of the DGCR chunk) - that is the integrity
+  check the tool's "dgcac k" performs (sub_422480 compares
+  crc32(data) with the stored value).
+
+  The DATA chunk holds a PARITY table, built by sub_422F20:
+      for every (row, column) the XOR of the archive's 4 byte words over
+      the "pages" (the archive is seen as a matrix of
+      rows x 256 columns x pages words, the words being read in the
+      natural order).  It is a RAID-4 style redundancy: it can restore a
+      lost 4 byte word, and for a one page archive (the usual case for a
+      small archive) the table degenerates into a full copy of the
+      archive's data.  The redundancy ratio is 1/pages, which is what
+      the -r level selects (level 9 = 100%).
+
+  MEASURED: two archives of the same size but different content have
+  1019 of the 1032 recovery bytes different (the first 8 bytes are a
+  fixed header), and two archives of different sizes have the same
+  first 8 bytes - so the table is a scrambled (encrypted) function of
+  the archive's content.
+
+  The table is not stored raw: after the parity pass the generator runs a
+  differential pass (the "k = 1 .. 2*pages-1" loop of sub_422F20, which
+  stores the rotated XOR of the neighbouring words) and then the base
+  SecureCryptograph class's cipher.  To use the table for a repair one
+  has to reverse those two steps.
+
+  7.2  WHAT THE TOOL DOES WITH IT
+  -------------------------------
+  Nothing.  Tested with a partly zeroed copy of dgca110-rec.dgcr:
+      dgcac k   -> "Check process failed."  (it detects the damage)
+      dgcac e   -> extracts the DAMAGED data (a wrong CRC), or nothing
+                   at all when the index (the IARC chunk) is damaged
+      neither command rewrites the file (checked byte for byte)
+  So the v1.10 tool writes the recovery data but never repairs with it;
+  it only uses the CRC in the INFO.  dgcunp.c does the same: it verifies
+  the recovery checksum and reports "the archive is DAMAGED", but it does
+  not repair.
+
 
 8. ENCRYPTION (-p password / -k keyfile)
 ----------------------------------------
