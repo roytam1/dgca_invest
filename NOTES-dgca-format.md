@@ -379,24 +379,41 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       NOT used here.  The first 64 prng calls (the first 32 data bytes)
       re-derive the key buffer for every single byte.
 
-  8.2  THE KEY DERIVATION (sub_421CF0)
-  ------------------------------------
-      h = SHA-512()
-      h.update(key_material, 32)      /* the reader passes the 32 bytes it
-                                         read from the archive file */
-      h.update(password, strlen)
-      state = h.digest()               (64 bytes = 16 dwords)
-      history = ""
-      for i in 0..38:                  (39 rounds)
-          history += state
-          h.update(state, 64)
-          h.update(state, 64)
-          state = h.digest()
-      MT.seed(history, 624)            /* see 8.3 */
-      index = counter = feedback = 0; the rolling state = 0
-      The writer hashes 96 bytes (the key material block) where the reader
-      hashes 32 - that difference is still unexplained; the writer's call
-      site is 0x409C51 and the reader's is 0x40FFB5.
+  8.2  THE KEY DERIVATION (sub_421CF0) - the C code is the reference
+  -----------------------------------------------------------------
+      void __thiscall sub_421CF0(this, a2, Block, a4..a10)
+      {
+          sub_4206B0(hash); sub_4200D0(hash);            /* SHA-512, init */
+          sub_4214C0(hash, a9, a10);                      /* update 1 */
+          p = (a8 >= 0x10) ? Block : &Block;              /* the string */
+          sub_4214C0(hash, p, a7);                         /* update 2 */
+          sub_420160(hash);                               /* finalize */
+          sub_4201F0(hash, state);                        /* getState */
+          history_dword0 = 0xFFFFFFFF;                    /* v31 */
+          for (i = 0; i < 39; i++) {
+              copy the state (16 dwords) to the history;    /* v32 + */
+              sub_4214C0(hash, state, 0x40);
+              sub_4214C0(hash, state, 0x40);
+              sub_4201F0(hash, state);
+          }
+          sub_426E80(this + 16, &v31, 624);                /* the MT's seed */
+          index = counter = feedback = 0; the rolling state = 0;
+      }
+      So:  SHA-512(data || string), 39 rounds, and the MT's seed =
+      [0xFFFFFFFF] + the history's dwords 0..622 (623 dwords) - the
+      0xFFFFFFFF is the dword in front of the history, NOT a prefix of the
+      history itself.
+
+      The string is an MSVC std::string passed by value: a7 = its size,
+      a8 = its capacity, Block = its data (or the inline buffer).
+
+      sub_421EE0 ("setKey and verify") calls sub_421CF0 with the string
+      copied from a4 and the 8 bytes at &a2 - and the caller pushes two
+      zero dwords there, so the 8 hashed bytes are 4 zero bytes followed by
+      the caller's return address.  That key is used for the PASSWORD
+      CHECK only (the writer and the reader call it from different places,
+      so the return address - and with it the key - differs; the check
+      data is encrypted with it in both cases, so it works).
 
   8.3  THE MT19937 VARIANT (sub_426E80 / sub_426B30 / sub_426EC0)
   ---------------------------------------------------------------
@@ -404,15 +421,14 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
           for i in 0..623: state[i] = key[i % key_length]
           twist()
       The twist is the standard MT19937 twist, but the TEMPERING is applied
-      to the state during the twist (a "tempered state" variant); the output
-      (sub_426EC0) returns the raw state word.  The twist is chosen by a
-      CPUID check (sub_426980): with MMX/SSE the MMX version (sub_426B30),
-      otherwise the scalar one (sub_4269E0).
-      The MT's key = the 624 dwords starting at &history[1] (the history's
-      first dword is skipped, and the dword 1 is pre-set to 0xFFFFFFFF but
-      overwritten by the first round's state).
+      to the state during the twist (a "tempered state" variant); the
+      output (sub_426EC0) returns the raw state word.  The first 32 words
+      after the seeding are therefore the same as the standard MT19937's
+      first 32 outputs; from the second twist on the two differ.  The twist
+      is chosen by a CPUID check (sub_426980): with MMX/SSE the MMX version
+      (sub_426B30), otherwise the scalar one (sub_4269E0).
 
-  8.4  SCOPE (measured by diffing an encrypted and a plain archive)
+    8.4  SCOPE (measured by diffing an encrypted and a plain archive)
   ----------------------------------------------------------------
       * the whole DGCC chunk (the 32 byte header + the payload) is encrypted
         as ONE unit - the chunk's ID and its size are encrypted too, so the
