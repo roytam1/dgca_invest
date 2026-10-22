@@ -1575,22 +1575,30 @@ static int dgcd_info(const u8 *img, u32 size, dgpart_t *p)
     return 1;
 }
 
-/* pick one candidate per part index; the sizes must add up to the size
- * of the whole file */
-static int dgcd_choose(dgpart_t *cand, int ncand, int idx, u32 need,
-                       dgpart_t *chosen, int nparts)
+/* Collect every combination of the candidates that uses one file per part
+ * index and whose part sizes add up to the size of the whole file.  A .dgd
+ * set and a .dgdr set hold the same file with different part boundaries,
+ * so more than one combination can be possible.  The combinations are the
+ * indexes of the candidates. */
+#define MAXCOMBO 64
+static int g_combo[MAXCOMBO][MAXPART];
+static int g_ncombo;
+
+static void dgcd_combos(int idx, u32 need, int nparts)
 {
     int i;
-    if (idx >= nparts) return need == 0;
-    for (i = 0; i < ncand; i++) {
-        if (cand[i].part != (u32)idx) continue;
-        if (cand[i].partsize > need) continue;
-        chosen[idx] = cand[i];
-        if (dgcd_choose(cand, ncand, idx + 1, need - cand[i].partsize,
-                        chosen, nparts))
-            return 1;
+    if (g_ncombo >= MAXCOMBO) return;
+    if (idx >= nparts) {
+        if (need == 0) g_ncombo++;
+        return;
     }
-    return 0;
+    for (i = 0; i < g_npart; i++) {
+        if (g_part[i].part != (u32)idx) continue;
+        if (g_part[i].partsize > need) continue;
+        g_combo[g_ncombo][idx] = i;
+        dgcd_combos(idx + 1, need - g_part[i].partsize, nparts);
+        if (g_ncombo >= MAXCOMBO) return;
+    }
 }
 
 /* collect the candidate files of the directory */
@@ -1632,8 +1640,8 @@ static int dgcd_main(const char *path, const char *outdir, int verbose,
 {
     u8 *img;
     u32 size;
-    dgpart_t ref, chosen[MAXPART];
-    int i, rc;
+    dgpart_t ref;
+    int i, rc, try;
     u32 off, nparts, total;
     u8 *buf;
     char dir[1024], outpath[2048];
@@ -1683,7 +1691,6 @@ static int dgcd_main(const char *path, const char *outdir, int verbose,
     dgcd_scan(dir, ref.mat + 0x20, nparts);
     /* the file itself is always a candidate */
     if (g_npart < MAXPART) {
-        strcpy(g_part[g_npart].path, path);
         g_part[g_npart] = ref;
         strcpy(g_part[g_npart].path, path);
         g_npart++;
@@ -1694,84 +1701,89 @@ static int dgcd_main(const char *path, const char *outdir, int verbose,
             printf("  part %u  %8u bytes  %s\n", g_part[i].part,
                    g_part[i].partsize, g_part[i].path);
     }
-    memset(chosen, 0, sizeof(chosen));
-    if (!dgcd_choose(g_part, g_npart, 0, total, chosen, (int)nparts)) {
+    g_ncombo = 0;
+    dgcd_combos(0, total, (int)nparts);
+    if (!g_ncombo) {
         printf("\n*** the parts of the file are missing or do not fit "
                "together\n");
         free(img);
         return 1;
     }
 
-    /* put the parts together */
+    /* put the parts together; every combination is tried, the one whose
+     * SHA-512 matches the INFO chunk is the right one */
     buf = (u8 *)malloc(total ? total : 1);
     if (!buf) { printf("out of memory\n"); free(img); return 1; }
-    off = 0;
-    for (i = 0; i < (int)nparts; i++) {
-        u8 *pimg;
-        u32 psize, doff, dps;
-        pimg = slurp2(chosen[i].path, &psize);
-        if (!pimg) { printf("cannot open %s\n", chosen[i].path); free(buf); free(img); return 1; }
-        if (repair) {
-            /* a .dgdr carries the recovery data of its own bytes */
-            u32 goff = align16(32 + rd32(pimg + 8));
-            if (goff + 32 <= psize && !memcmp(pimg + goff, "DGCR", 4)) {
-                u8 *simg = g_img;
-                u32 ssize = g_imgsize;
-                chunk_t dg;
-                g_img = pimg; g_imgsize = psize;
-                dg.off = goff; dg.psize = rd32(pimg + goff + 8); dg.depth = 0;
-                memcpy(dg.id, "DGCR", 5);
-                printf("\n*** the recovery data of %s\n", chosen[i].path);
-                dgcr_repair(&dg, goff, 0, chosen[i].path, verbose);
-                /* write the repaired file next to the original */
-                {
-                    char out[1024];
-                    FILE *f;
-                    sprintf(out, "%s.repaired", chosen[i].path);
-                    f = fopen(out, "wb");
-                    if (f) {
-                        fwrite(pimg, 1, goff, f);
-                        fclose(f);
-                        printf("the repaired file was written to %s\n", out);
-                    }
-                }
-                g_img = simg; g_imgsize = ssize;
-            }
-        }
-        if (!dgcd_child(pimg, 0, rd32(pimg + 8), "DATA", &doff, &dps)) {
-            printf("%s has no DATA chunk\n", chosen[i].path);
-            free(pimg); free(buf); free(img);
-            return 1;
-        }
-        if (dps > total - off) dps = total - off;
-        memcpy(buf + off, pimg + doff + 32, dps);
-        if (chosen[i].encrypted) {
-            crypt_t c;
-            crypt_setkey_pw2(&c, chosen[i].mat, 96, g_pw, g_pwlen);
-            crypt_decrypt(&c, buf + off, dps);
-        }
-        off += dps;
-        free(pimg);
-    }
-    free(img);
-    printf("assembled  : %u bytes\n", off);
-
-    /* the SHA-512 of the whole file must match the INFO's */
-    {
+    for (try = 0; try < g_ncombo; try++) {
         sha512_t h;
         u8 st[64];
-        int ok;
+        off = 0;
+        for (i = 0; i < (int)nparts; i++) {
+            u8 *pimg;
+            u32 psize, doff, dps;
+            dgpart_t *cp = &g_part[g_combo[try][i]];
+            pimg = slurp2(cp->path, &psize);
+            if (!pimg) { printf("cannot open %s\n", cp->path); free(buf); free(img); return 1; }
+            if (repair) {
+                /* a .dgdr carries the recovery data of its own bytes */
+                u32 goff = align16(32 + rd32(pimg + 8));
+                if (goff + 32 <= psize && !memcmp(pimg + goff, "DGCR", 4)) {
+                    u8 *simg = g_img;
+                    u32 ssize = g_imgsize;
+                    chunk_t dg;
+                    g_img = pimg; g_imgsize = psize;
+                    dg.off = goff; dg.psize = rd32(pimg + goff + 8); dg.depth = 0;
+                    memcpy(dg.id, "DGCR", 5);
+                    printf("\n*** the recovery data of %s\n", cp->path);
+                    dgcr_repair(&dg, goff, 0, cp->path, verbose);
+                    /* write the repaired file next to the original */
+                    {
+                        char out[1024];
+                        FILE *f;
+                        sprintf(out, "%s.repaired", cp->path);
+                        f = fopen(out, "wb");
+                        if (f) {
+                            fwrite(pimg, 1, goff, f);
+                            fclose(f);
+                            printf("the repaired file was written to %s\n", out);
+                        }
+                    }
+                    g_img = simg; g_imgsize = ssize;
+                }
+            }
+            if (!dgcd_child(pimg, 0, rd32(pimg + 8), "DATA", &doff, &dps)) {
+                printf("%s has no DATA chunk\n", cp->path);
+                free(pimg); free(buf); free(img);
+                return 1;
+            }
+            if (dps > total - off) dps = total - off;
+            memcpy(buf + off, pimg + doff + 32, dps);
+            if (cp->encrypted) {
+                crypt_t c;
+                crypt_setkey_pw2(&c, cp->mat, 96, g_pw, g_pwlen);
+                crypt_decrypt(&c, buf + off, dps);
+            }
+            off += dps;
+            free(pimg);
+        }
+        /* the SHA-512 of the whole file must match the INFO's */
         sha512_init(&h);
         sha512_update(&h, buf, total);
         sha512_final(&h);
         sha512_state(&h, st);
-        ok = !memcmp(st, ref.mat + 0x20, 64);
-        printf("the SHA-512: %s\n", ok ? "ok" : "MISMATCH - the file is DAMAGED");
-        if (!ok) {
-            free(buf);
-            return 1;
-        }
+        if (!memcmp(st, ref.mat + 0x20, 64)) break;
+        if (verbose)
+            printf("the combination %d does not fit (the SHA-512 differs)\n",
+                   try + 1);
     }
+    free(img);
+    printf("assembled  : %u bytes\n", off);
+    if (try >= g_ncombo) {
+        printf("the SHA-512: MISMATCH - the file is DAMAGED\n");
+        free(buf);
+        return 1;
+    }
+    printf("the SHA-512: ok\n");
 
     /* write the file */
     {
