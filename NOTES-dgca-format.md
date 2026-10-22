@@ -594,10 +594,18 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
            -f     one block per file (not the solid mode)
            -i     identity: do not write the time stamps
            -r<n>  append the recovery data (the parity table)
-  It writes the same format as dgcac.exe and the archives it writes are
-  read back by dgcac.exe ("dgcac l", "dgcac e" - the extracted files are
-  byte identical) and by dgcunp.c.  The CM coder of dgcpk.c is byte
-  identical to the Python reference (cm.py).
+         dgcpk s [-S<n>] [-p<password>|-k<keyfile>] [-r<n>] <base> <file>
+           -S<n>  the size of a part of a spanning file (in bytes)
+           -p     the password of the spanning file
+           -k     the key file of the spanning file
+           -r<n>  also write the .dgdr set (with the recovery data)
+   It writes the same format as dgcac.exe and the archives it writes are
+   read back by dgcac.exe ("dgcac l", "dgcac e" - the extracted files are
+   byte identical) and by dgcunp.c.  The CM coder of dgcpk.c is byte
+   identical to the Python reference (cm.py).
+   It also writes the spanning files (.dgd / .dgdr) of section 12 - with
+   the same input file they are byte identical to the ones of the
+   original tool.
 
   9.1  HOW THE PACKER WORKS
   -------------------------
@@ -770,6 +778,35 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
 
    "dgcunp -R file.dgdr" applies the recovery data of the .dgdr to its own
    bytes before the part is used.
+
+   12.5  THE WRITER (what dgcpk s does)
+   ------------------------------------
+   The original writer (sub_40AE90) splits a file into parts of a given
+   size and writes <base>%04d.dgd.  The part's data is NOT compressed.
+   With the recovery data the same parts are also written as
+   <base>%04d.dgdr (the DATA chunk of the FIRST part is then shorter -
+   the recovery data needs the room - and the other parts hold the rest
+   of the file; the .dgdr set therefore has its own part boundaries and
+   its own number of parts).
+
+   dgcpk s [-S<n>] [-p<password>|-k<keyfile>] [-r<n>] <base> <file>
+     -S<n>   the size of a part in bytes (the default: the whole file)
+     -r<n>   also write the .dgdr set (with the recovery data)
+
+   With the same input file (the same name and the same time stamp) the
+   files that dgcpk writes are BYTE IDENTICAL to the ones of the original
+   tool - the plain .dgd, the encrypted .dgd and the .dgdr.
+
+   The DFDT payload is:
+       +0x00 u32  the CRC-32 of the whole file
+       +0x04 u32  0x20 (the size of the structure)
+       +0x08 8B   0
+       +0x10 u64  the FILETIME of the file
+       +0x18 8B   0
+
+   The third part of the recovery data (the parity table) is the CRC-32 of
+   every row of the matrix (the words of the row over all the pages) -
+   not the offsets of the row blocks.
 
 
 

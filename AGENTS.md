@@ -119,7 +119,12 @@ DGCD
 * The crypto is the archive's: `key1 = SHA-512(8 zeros | password)` for the material's
   92 bytes at `+4`, `key2 = SHA-512(the PLAINTEXT 96-byte material | password)` for the
   name, the DFDT and the DATA payload.
+* The DFDT payload: `+00` the CRC-32 of the whole file, `+04` 0x20, `+10` the FILETIME.
 * Full spec: `NOTES-dgca-format.md` section 12.
+
+`dgcpk s [-S<n>] [-p<pw>|-k<keyfile>] [-r<n>] <base> <file>` writes them (the parts
+`<base>%04d.dgd`, with `-r` also `<base>%04d.dgdr` - whose first part is shorter). With
+the same input file the output is **byte identical** to the original tool's.
 
 ---
 
@@ -244,6 +249,7 @@ Current state of `dgcunp.c`:
 | the packer (`dgcpk.c`) | working - `dgcac.exe` reads back the archives it writes and the extracted files are byte identical |
 | encrypted archives (`-p` / `-k`) | working - the two keys are cracked (see `NOTES-dgca-format.md` 8.7); the extracted files are byte identical to `dgcac.exe`'s |
 | the spanning files (`.dgd` / `.dgdr`) | working - the parts are found in the directory, put together, checked against the SHA-512 of the INFO chunk and written out; `-R` applies the recovery data of a `.dgdr` |
+| the packer writes the spanning files too | working - `dgcpk s` writes byte identical `.dgd` / `.dgdr` files (the plain, the encrypted and the recovery variant) |
 | the match coder (the params' bit 1) | not implemented (unused by the sample archives) |
 
 The regression test: extract every archive in the work area and check that
