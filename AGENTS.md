@@ -98,6 +98,29 @@ DGCA
   create/modify, `+18` original size, `+20` "compressed" size, `+28` offset in the DATA
   payload.
 
+### The spanning files `.dgd` / `.dgdr` (SOLVED)
+
+A big file is split into parts; every part is a chunk tree of its own and the parts are
+named `<base>%04d.dgd`.  The recon function of the binary (`sub_414A20`, the vtable slot
+0x10C of `off_437D98`) globs the directory for the `*.dgd` / `*.dgdr` files and puts the
+parts back together - it is **not** in the CLI (the GUI only).
+
+```
+DGCD
+|-- INFO  116 B  +00 flags(bit0=encrypted) +04 part index +08 nparts
+|               +10 this part's size +18 the whole size +20 64B SHA-512
+|               +60 u32 name len + the name
+|-- DFDT   32 B  the date and the time
+`-- DATA          the part's RAW bytes (not compressed)
+```
+
+* The `.dgdr` has a shorter DATA chunk and a trailing `DGCR` (the parity covers the
+  bytes of the `.dgdr` in front of it).
+* The crypto is the archive's: `key1 = SHA-512(8 zeros | password)` for the material's
+  92 bytes at `+4`, `key2 = SHA-512(the PLAINTEXT 96-byte material | password)` for the
+  name, the DFDT and the DATA payload.
+* Full spec: `NOTES-dgca-format.md` section 12.
+
 ---
 
 ## 4. The codec (SOLVED - byte exact)
@@ -198,6 +221,8 @@ dgcunp.exe -o outdir archive.dgc      # extract
 dgcunp.exe -psecret archive.dgc      # extract an encrypted archive (-p)
 dgcunp.exe -kmykey.key archive.dgc   # ... or with a key file (-k)
 dgcunp.exe -R archive.dgcr           # repair it with its recovery data
+dgcunp.exe -o outdir file.dgd        # a spanning file: put the parts together
+dgcunp.exe -psecret -o outdir f.dgd  # ... an encrypted one
 dgcunp.exe -t                        # the crypto's self test
 ```
 
@@ -218,6 +243,7 @@ Current state of `dgcunp.c`:
 | the recovery data (`-R`): the parity table, the repair, the archive's CRC-32 | working - a damaged `.dgcr` is repaired and extracted without errors |
 | the packer (`dgcpk.c`) | working - `dgcac.exe` reads back the archives it writes and the extracted files are byte identical |
 | encrypted archives (`-p` / `-k`) | working - the two keys are cracked (see `NOTES-dgca-format.md` 8.7); the extracted files are byte identical to `dgcac.exe`'s |
+| the spanning files (`.dgd` / `.dgdr`) | working - the parts are found in the directory, put together, checked against the SHA-512 of the INFO chunk and written out; `-R` applies the recovery data of a `.dgdr` |
 | the match coder (the params' bit 1) | not implemented (unused by the sample archives) |
 
 The regression test: extract every archive in the work area and check that

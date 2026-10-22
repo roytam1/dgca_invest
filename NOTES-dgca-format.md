@@ -583,6 +583,9 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
          -k<keyfile> decrypts the archive in memory (the two keys of
          section 8.7) and the extracted files are byte identical to the
          ones dgcac.exe extracts.
+  works: the spanning files (.dgd / .dgdr) - see section 12: the parts are
+         found in the directory, put together, checked against the SHA-512
+         of the INFO chunk and written out.
   open: the match coder (the params' bit 1).
 
   dgcpk.c   MSVC6, C89.  the PACKER (the archiver):
@@ -672,6 +675,101 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
   * The chain walk's start index is the block's v22 (the payload's +0x10).
   * The crypto's "scratch" buffer overlaps the upper half of the rolling
     state, so the feedback bytes are hashed twice (section 8.1).
-  * The binary's SHA-512 reverses every 8 byte group of the message
-    (section 8.4) - a plain SHA-512 gives a different key stream.
+   * The binary's SHA-512 reverses every 8 byte group of the message
+     (section 8.4) - a plain SHA-512 gives a different key stream.
+
+
+
+12. THE SPANNING FILES (.dgd / .dgdr)
+--------------------------------------
+   A file that is too big for a single archive is split into parts.  Every
+   part is a chunk tree of its own and the parts are named
+
+       <base>%04d.dgd          (the writer uses the format "%04d")
+
+   The binary's recon function (sub_414A20, the vtable slot 0x10C of
+   off_437D98) globs the directory for the "*.dgd" and the "*.dgdr" files,
+   reads the 96 byte "material" of every candidate and puts the parts
+   back together.  It is NOT in the command line interface (the usage text
+   lists only a/e/m/k/l) - it is a function of the GUI.
+
+   12.1  THE STRUCTURE
+   -------------------
+       DGCD  (the root, flags = 1)
+       |-- INFO  (116 bytes)
+       |     +0x00 u32  flags          bit 0 = encrypted
+       |     +0x04 u32  the index of this part
+       |     +0x08 u32  the number of the parts
+       |     +0x0c u32  0
+       |     +0x10 u32  the size of this part
+       |     +0x14 u32  0
+       |     +0x18 u32  the size of the whole file
+       |     +0x1c u32  0
+       |     +0x20 64B  the SHA-512 of the whole file
+       |     +0x60 u32  the length of the name
+       |     +0x64      the name (UTF-8)
+       |-- DFDT  (32 bytes)  the date and the time of the file
+       `-- DATA  (this part's bytes)
+
+   The DATA payload is NOT compressed - it is the raw data of the file.
+   The 64 bytes at INFO+0x20 are the SHA-512 of the WHOLE file (the little
+   endian word order of the binary, see section 8.4) - that is the check
+   of the reassembly.
+
+   The DFDT payload is 32 bytes:
+       +0x00 u32  a Unix time stamp
+       +0x04 u32  0x20
+       +0x08 8B   0
+       +0x10 u64  a FILETIME
+       +0x18 8B   0
+
+   12.2  THE .dgdr (THE RECOVERY VARIANT)
+   ---------------------------------------
+   A .dgdr has the same structure but a SHORTER DATA chunk (the part is
+   cut short to make room for the recovery data) and a trailing chunk:
+
+       DGCR  (the recovery record, flags = 1)
+       |-- INFO  (48 bytes)  the parameters of section 7.1
+       `-- DATA  (the parity table, encrypted with the fixed key)
+
+   The parity covers the bytes of the .dgdr IN FRONT of the DGCR chunk
+   (the offset of the DGCR chunk in the file - the INFO's "off" field of
+   the .dgc archives is 0 here, there is no archive CRC either).
+
+   A set of .dgd files and a set of .dgdr files hold the SAME file with
+   different part boundaries (the .dgdr's parts are shorter).  Both sets
+   can be in the same directory: the parts are told apart by the part
+   index and the size of the part (the sizes must add up to the size of
+   the whole file).
+
+   12.3  THE ENCRYPTION
+   --------------------
+   The same crypto as the archives (section 8), but the keys are derived
+   from the material of the INFO chunk:
+
+       key1 = SHA-512( 8 zero bytes | password )   stretched over 39 rounds
+              -> the 92 bytes of the material at INFO+4
+              (the 4 bytes of the flags stay in the clear)
+       key2 = SHA-512( the PLAINTEXT 96 byte material | password )
+              -> the name (INFO+0x60), the DFDT payload and the DATA
+                 payload - each of them with its own key stream
+
+   The material of the key2 is the PLAINTEXT one (the reader decrypts the
+   material with key1 first, then derives key2 from it) - the writer
+   copies the material before it encrypts it (qmemcpy(v519, Buffer, 96)
+   at 0x40CCBE).
+
+   12.4  WHAT dgcunp DOES WITH THEM
+   ---------------------------------
+   "dgcunp -o outdir file.dgd" globs the directory for the *.dgd and the
+   *.dgdr files, takes the candidates whose material has the same hash and
+   the same number of parts, picks the combination whose part sizes add
+   up to the size of the whole file, decrypts the parts (if the flags say
+   so), checks the SHA-512 of the result and writes the file under the
+   name of the INFO chunk.
+
+   "dgcunp -R file.dgdr" applies the recovery data of the .dgdr to its own
+   bytes before the part is used.
+
+
 

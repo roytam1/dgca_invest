@@ -30,7 +30,11 @@
  *        tag 1 : COMPRESSED -> 32 byte block header, stream A, stream B
  *        tag 2 : CHAIN      -> `size` blocks follow, each tag 1
  *
- *  Usage:  dgcunp [-l] [-v] [-p<password> | -k<keyfile>] [-o outdir] <archive>
+ *  Usage:  dgcunp [-l] [-v] [-R] [-p<password> | -k<keyfile>] [-o outdir] <archive>
+ *
+ *  A spanning file (.dgd / .dgdr) is accepted too: its parts are put
+ *  together and the file is written out (see the section "The spanning
+ *  files" further down).
  * ------------------------------------------------------------------ */
 
 #include <stdio.h>
@@ -1318,13 +1322,16 @@ static void dgcr_report(chunk_t *dgcr, int verbose)
 }
 
 /* the repair: use the parity table to restore the damaged words.  The
- * archive's checksum (in the INFO chunk) is the final check. */
-static int dgcr_repair(chunk_t *dgcr, const char *path, int verbose)
+ * archive's checksum (in the INFO chunk) is the final check.
+ * off = the offset of the end of the covered area, crc = its checksum
+ * (0 if the record has none - the .dgdr of a spanning file). */
+static int dgcr_repair(chunk_t *dgcr, u32 off, u32 crc, const char *path,
+                       int verbose)
 {
     chunk_t info, data;
     const u8 *ip;
     u8 *rec, *par, *rowx;
-    u32 off, crc, len, cols, rows, pages, i, j, k, fixed = 0, bad = 0, alen;
+    u32 len, cols, rows, pages, i, j, k, fixed = 0, bad = 0, alen;
     crypt_t c;
 
     info = *child_chunk(dgcr, "INFO");
@@ -1332,8 +1339,6 @@ static int dgcr_repair(chunk_t *dgcr, const char *path, int verbose)
     if (!info.id[0] || !data.id[0]) { printf("recovery record: incomplete\n"); return 0; }
     if (info.psize < 0x30) { printf("recovery record: the INFO chunk is too small\n"); return 0; }
     ip = g_img + info.off + 32;
-    off = rd32(ip + 0x28);
-    crc = rd32(ip + 0x2C);
     len = rd32(ip + 4);
     cols = rd32(ip + 0x10);
     rows = rd32(ip + 0x14);
@@ -1406,25 +1411,386 @@ static int dgcr_repair(chunk_t *dgcr, const char *path, int verbose)
            fixed, bad);
     {
         u32 c2 = crc32_buf(g_img, off);
-        printf("the archive's checksum %08x %s\n", c2,
-               c2 == crc ? "ok - the archive is repaired" :
-               (bad ? "still damaged" : "MISMATCH"));
-        if (c2 == crc && crc) {
-            /* write the repaired archive next to the original */
-            char out[1024];
-            FILE *f;
-            sprintf(out, "%s.repaired", path);
-            f = fopen(out, "wb");
-            if (f) {
-                fwrite(g_img, 1, off, f);
-                fclose(f);
-                printf("the repaired archive was written to %s\n", out);
+        if (crc) {
+            printf("the archive's checksum %08x %s\n", c2,
+                   c2 == crc ? "ok - the archive is repaired" :
+                   (bad ? "still damaged" : "MISMATCH"));
+            if (c2 == crc) {
+                /* write the repaired archive next to the original */
+                char out[1024];
+                FILE *f;
+                sprintf(out, "%s.repaired", path);
+                f = fopen(out, "wb");
+                if (f) {
+                    fwrite(g_img, 1, off, f);
+                    fclose(f);
+                    printf("the repaired archive was written to %s\n", out);
+                }
             }
+        } else {
+            printf("the recovery data has been applied (%u bytes)\n", off);
         }
     }
     (void)verbose;
     free(rec);
     return (int)fixed;
+}
+
+/* the helpers of the long / unicode paths (they are defined further down) */
+static void utf8_to_utf16(const char *s, w16_t *out, int max);
+static void long_path_w(const char *path, w16_t *out, int max);
+static void make_dirs_w(const w16_t *wpath);
+static int  write_file_w(const w16_t *wpath, const u8 *data, u32 n);
+
+/* load a file; returns NULL if it cannot be read */
+static u8 *slurp2(const char *path, u32 *size){
+    FILE *f = fopen(path, "rb");
+    u8 *p;
+    long n;
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET);
+    if (n < 0) { fclose(f); return NULL; }
+    p = (u8 *)malloc((size_t)n + 16);
+    if (!p) { fclose(f); return NULL; }
+    if (fread(p, 1, (size_t)n, f) != (size_t)n) {
+        fclose(f); free(p); return NULL;
+    }
+    fclose(f);
+    *size = (u32)n;
+    return p;
+}
+
+/* ------------------------------------------------------------------ *
+ *  The spanning files (.dgd / .dgdr)
+ *
+ *  A file that is too big for a single archive is split into parts and
+ *  every part is a chunk tree of its own.  The parts are named
+ *  <base>%04d.dgd (the writer uses the format "%04d").  The recon
+ *  function of the binary (sub_414A20) globs the directory for the
+ *  *.dgd and *.dgdr files and puts the parts back together.
+ *
+ *      DGCD  (the root)
+ *      |-- INFO  (116 bytes)
+ *      |     +0x00 u32  flags          (bit 0 = encrypted)
+ *      |     +0x04 u32  the index of this part
+ *      |     +0x08 u32  the number of the parts
+ *      |     +0x0c u32  0
+ *      |     +0x10 u32  the size of this part
+ *      |     +0x14 u32  0
+ *      |     +0x18 u32  the size of the whole file
+ *      |     +0x1c u32  0
+ *      |     +0x20 64B  the SHA-512 of the whole file
+ *      |     +0x60 u32  the length of the name
+ *      |     +0x64      the name (UTF-8)
+ *      |-- DFDT  (32 bytes)  the date and the time of the file
+ *      `-- DATA  (this part's bytes)
+ *
+ *  A .dgdr has the same structure but a shorter DATA chunk and a
+ *  trailing DGCR chunk with the recovery data of the file (the parity
+ *  covers the bytes of the .dgdr in front of the DGCR chunk).
+ *
+ *  The encryption is the same as the archive's:
+ *      key1 = SHA-512( 8 zero bytes | password )
+ *             -> the 92 bytes of the INFO material at +4
+ *      key2 = SHA-512( the PLAINTEXT 96 byte material | password )
+ *             -> the name, the DFDT and the DATA payload
+ *  (each of them with its own key stream)
+ * ------------------------------------------------------------------ */
+
+#define MAXPART 128
+#define DGNAME 512
+
+typedef struct {
+    char path[1024];
+    u8   mat[96];        /* the INFO material (decrypted) */
+    char name[DGNAME];
+    u32  namelen;
+    u32  part;           /* the index of the part */
+    u32  partsize;
+    u32  total;
+    u32  nparts;
+    int  encrypted;
+} dgpart_t;
+
+static dgpart_t g_part[MAXPART];
+static int      g_npart;
+
+/* find a child chunk of a container (the container's header is at base) */
+static int dgcd_child(const u8 *img, u32 base, u32 psize, const char *id,
+                      u32 *coff, u32 *cps)
+{
+    u32 p = base + 32, end = base + 32 + psize;
+    while (p + 32 <= end) {
+        const u8 *h = img + p;
+        u32 ps = rd32(h + 8);
+        if (!memcmp(h, id, 4)) { *coff = p; *cps = ps; return 1; }
+        p = align16(p + 32 + ps);
+    }
+    return 0;
+}
+
+/* read the INFO chunk of a .dgd: the material (96 bytes, decrypted if
+ * the file is encrypted) and the name.  Returns 0 if the file is not a
+ * .dgd and -1 if it is encrypted but no password is known. */
+static int dgcd_info(const u8 *img, u32 size, dgpart_t *p)
+{
+    u32 ioff, ips, flags, nl;
+    u8 mat[96], *nm;
+    crypt_t c;
+    if (size < 32 || memcmp(img, "DGCD", 4)) return 0;
+    if (!dgcd_child(img, 0, rd32(img + 8), "INFO", &ioff, &ips)) return 0;
+    if (ips < 96) return 0;
+    memcpy(mat, img + ioff + 32, 96);
+    flags = rd32(mat);
+    p->encrypted = (flags & 1) ? 1 : 0;
+    if (p->encrypted) {
+        if (!g_pwlen) return -1;
+        crypt_setkey_pw1(&c, g_pw, g_pwlen);
+        crypt_decrypt(&c, mat + 4, 92);
+    }
+    memcpy(p->mat, mat, 96);
+    p->part      = rd32(mat + 4);
+    p->nparts    = rd32(mat + 8);
+    p->partsize  = rd32(mat + 16);
+    p->total     = rd32(mat + 24);
+    /* the name: the length and the text are encrypted with key2 */
+    p->namelen = 0;
+    p->name[0] = 0;
+    if (ips > 96) {
+        nm = (u8 *)malloc(ips - 96);
+        if (!nm) return 0;
+        memcpy(nm, img + ioff + 32 + 96, ips - 96);
+        if (p->encrypted) {
+            crypt_setkey_pw2(&c, mat, 96, g_pw, g_pwlen);
+            crypt_decrypt(&c, nm, ips - 96);
+        }
+        nl = rd32(nm);
+        if (nl > ips - 100) nl = 0;
+        if (nl > DGNAME - 1) nl = DGNAME - 1;
+        memcpy(p->name, nm + 4, nl);
+        p->name[nl] = 0;
+        p->namelen = nl;
+        free(nm);
+    }
+    return 1;
+}
+
+/* pick one candidate per part index; the sizes must add up to the size
+ * of the whole file */
+static int dgcd_choose(dgpart_t *cand, int ncand, int idx, u32 need,
+                       dgpart_t *chosen, int nparts)
+{
+    int i;
+    if (idx >= nparts) return need == 0;
+    for (i = 0; i < ncand; i++) {
+        if (cand[i].part != (u32)idx) continue;
+        if (cand[i].partsize > need) continue;
+        chosen[idx] = cand[i];
+        if (dgcd_choose(cand, ncand, idx + 1, need - cand[i].partsize,
+                        chosen, nparts))
+            return 1;
+    }
+    return 0;
+}
+
+/* collect the candidate files of the directory */
+static void dgcd_scan(const char *dir, const u8 *refhash, u32 nparts)
+{
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    char pat[1024];
+    int pass;
+    for (pass = 0; pass < 2; pass++) {
+        sprintf(pat, "%s\\*.%s", dir, pass ? "dgdr" : "dgd");
+        h = FindFirstFileA(pat, &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            u8 *img;
+            u32 size;
+            dgpart_t p;
+            char full[1024];
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            sprintf(full, "%s\\%s", dir, fd.cFileName);
+            img = slurp2(full, &size);
+            if (!img) continue;
+            memset(&p, 0, sizeof(p));
+            p.part = 0xFFFFFFFFu;
+            if (dgcd_info(img, size, &p) == 1 && p.nparts == nparts &&
+                !memcmp(p.mat + 0x20, refhash, 64) && g_npart < MAXPART) {
+                strcpy(p.path, full);
+                g_part[g_npart++] = p;
+            }
+            free(img);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+}
+
+/* the main routine of the spanning files */
+static int dgcd_main(const char *path, const char *outdir, int verbose,
+                     int listonly, int repair)
+{
+    u8 *img;
+    u32 size;
+    dgpart_t ref, chosen[MAXPART];
+    int i, rc;
+    u32 off, nparts, total;
+    u8 *buf;
+    char dir[1024], outpath[2048];
+
+    img = slurp2(path, &size);
+    if (!img) { printf("cannot open %s\n", path); return 1; }
+    memset(&ref, 0, sizeof(ref));
+    rc = dgcd_info(img, size, &ref);
+    if (rc < 0) {
+        printf("\n*** this file is ENCRYPTED (-p / -k).\n"
+               "    Use -p<password> or -k<keyfile> to decrypt it.\n");
+        free(img);
+        return 1;
+    }
+    if (rc == 0) {
+        printf("%s is not a spanning file (.dgd)\n", path);
+        free(img);
+        return 1;
+    }
+    printf("file      : %s (%u bytes)\n", path, size);
+    printf("spanning  : %u parts, %u bytes in total, the name is '%s'\n",
+           ref.nparts, ref.total, ref.name);
+    printf("this part : %u, %u bytes\n", ref.part, ref.partsize);
+    if (verbose) {
+        u32 i2;
+        printf("the SHA-512 of the whole file: ");
+        for (i2 = 0; i2 < 64; i2++) printf("%02x", ref.mat[0x20 + i2]);
+        printf("\n");
+    }
+    if (listonly) { free(img); return 0; }
+
+    nparts = ref.nparts;
+    total  = ref.total;
+    if (nparts == 0 || nparts > MAXPART) {
+        printf("the number of the parts is not plausible\n");
+        free(img);
+        return 1;
+    }
+
+    /* the directory of the file */
+    strcpy(dir, path);
+    {
+        char *b = strrchr(dir, '\\');
+        if (b) *b = 0; else strcpy(dir, ".");
+    }
+    g_npart = 0;
+    dgcd_scan(dir, ref.mat + 0x20, nparts);
+    /* the file itself is always a candidate */
+    if (g_npart < MAXPART) {
+        strcpy(g_part[g_npart].path, path);
+        g_part[g_npart] = ref;
+        strcpy(g_part[g_npart].path, path);
+        g_npart++;
+    }
+    printf("found     : %d part files in %s\n", g_npart, dir);
+    if (verbose) {
+        for (i = 0; i < g_npart; i++)
+            printf("  part %u  %8u bytes  %s\n", g_part[i].part,
+                   g_part[i].partsize, g_part[i].path);
+    }
+    memset(chosen, 0, sizeof(chosen));
+    if (!dgcd_choose(g_part, g_npart, 0, total, chosen, (int)nparts)) {
+        printf("\n*** the parts of the file are missing or do not fit "
+               "together\n");
+        free(img);
+        return 1;
+    }
+
+    /* put the parts together */
+    buf = (u8 *)malloc(total ? total : 1);
+    if (!buf) { printf("out of memory\n"); free(img); return 1; }
+    off = 0;
+    for (i = 0; i < (int)nparts; i++) {
+        u8 *pimg;
+        u32 psize, doff, dps;
+        pimg = slurp2(chosen[i].path, &psize);
+        if (!pimg) { printf("cannot open %s\n", chosen[i].path); free(buf); free(img); return 1; }
+        if (repair) {
+            /* a .dgdr carries the recovery data of its own bytes */
+            u32 goff = align16(32 + rd32(pimg + 8));
+            if (goff + 32 <= psize && !memcmp(pimg + goff, "DGCR", 4)) {
+                u8 *simg = g_img;
+                u32 ssize = g_imgsize;
+                chunk_t dg;
+                g_img = pimg; g_imgsize = psize;
+                dg.off = goff; dg.psize = rd32(pimg + goff + 8); dg.depth = 0;
+                memcpy(dg.id, "DGCR", 5);
+                printf("\n*** the recovery data of %s\n", chosen[i].path);
+                dgcr_repair(&dg, goff, 0, chosen[i].path, verbose);
+                /* write the repaired file next to the original */
+                {
+                    char out[1024];
+                    FILE *f;
+                    sprintf(out, "%s.repaired", chosen[i].path);
+                    f = fopen(out, "wb");
+                    if (f) {
+                        fwrite(pimg, 1, goff, f);
+                        fclose(f);
+                        printf("the repaired file was written to %s\n", out);
+                    }
+                }
+                g_img = simg; g_imgsize = ssize;
+            }
+        }
+        if (!dgcd_child(pimg, 0, rd32(pimg + 8), "DATA", &doff, &dps)) {
+            printf("%s has no DATA chunk\n", chosen[i].path);
+            free(pimg); free(buf); free(img);
+            return 1;
+        }
+        if (dps > total - off) dps = total - off;
+        memcpy(buf + off, pimg + doff + 32, dps);
+        if (chosen[i].encrypted) {
+            crypt_t c;
+            crypt_setkey_pw2(&c, chosen[i].mat, 96, g_pw, g_pwlen);
+            crypt_decrypt(&c, buf + off, dps);
+        }
+        off += dps;
+        free(pimg);
+    }
+    free(img);
+    printf("assembled  : %u bytes\n", off);
+
+    /* the SHA-512 of the whole file must match the INFO's */
+    {
+        sha512_t h;
+        u8 st[64];
+        int ok;
+        sha512_init(&h);
+        sha512_update(&h, buf, total);
+        sha512_final(&h);
+        sha512_state(&h, st);
+        ok = !memcmp(st, ref.mat + 0x20, 64);
+        printf("the SHA-512: %s\n", ok ? "ok" : "MISMATCH - the file is DAMAGED");
+        if (!ok) {
+            free(buf);
+            return 1;
+        }
+    }
+
+    /* write the file */
+    {
+        char pathbuf[2048];
+        w16_t wpath[2048];
+        if (outdir) sprintf(pathbuf, "%s\\%s", outdir, ref.name);
+        else       strcpy(pathbuf, ref.name);
+        long_path_w(pathbuf, wpath, 2048);
+        make_dirs_w(wpath);
+        if (write_file_w(wpath, buf, total) != 0) {
+            printf("cannot create %s\n", pathbuf);
+            free(buf);
+            return 1;
+        }
+        strcpy(outpath, pathbuf);
+    }
+    printf("written    : %s (%u bytes)\n", outpath, total);
+    free(buf);
+    return 0;
 }
 
 /* ------------------- long / unicode paths -------------------
@@ -1524,7 +1890,9 @@ static void usage(void)
            "usage: dgcunp [-v] [-l] [-R] [-p<password> | -k<keyfile>] [-o outdir] <archive.dgc>\n"
            "  -R   repair a damaged archive with its recovery data (the DGCR chunk)\n"
            "  -p   the password of an encrypted archive (-p secret)\n"
-           "  -k   the key file of an encrypted archive (-k mykey.key)\n");
+           "  -k   the key file of an encrypted archive (-k mykey.key)\n"
+           "  a spanning file (.dgd / .dgdr) is also accepted: its parts are\n"
+           "  put together and the file is written out\n");
     exit(1);
 }
 
@@ -1561,15 +1929,28 @@ int main(int argc, char **argv)
     g_img = slurp(path, &g_imgsize);
     walk(0, g_imgsize, 0, NULL);
 
+    /* a spanning file (.dgd / .dgdr): the root chunk is "DGCD" */
+    if (g_imgsize >= 4 && !memcmp(g_img, "DGCD", 4)) {
+        int rc = dgcd_main(path, outdir, verbose, listonly, repair);
+        free(g_img);
+        return rc;
+    }
+
     /* The recovery data (the DGCR chunk) covers the archive AS IT IS
      * STORED - i.e. the encrypted bytes of an encrypted archive.  So the
      * recovery has to be handled before the decryption. */
     {
         chunk_t *dgcr = find_chunk("DGCR", 0);
         if (dgcr) {
+            chunk_t *info = child_chunk(dgcr, "INFO");
+            u32 off = 0, crc = 0;
+            if (info && info->id[0] && info->psize >= 0x30) {
+                off = rd32(g_img + info->off + 32 + 0x28);
+                crc = rd32(g_img + info->off + 32 + 0x2C);
+            }
             printf("\n");
             dgcr_report(dgcr, verbose);
-            if (repair) dgcr_repair(dgcr, path, verbose);
+            if (repair) dgcr_repair(dgcr, off, crc, path, verbose);
         }
     }
 
