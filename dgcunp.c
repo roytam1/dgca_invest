@@ -30,7 +30,7 @@
  *        tag 1 : COMPRESSED -> 32 byte block header, stream A, stream B
  *        tag 2 : CHAIN      -> `size` blocks follow, each tag 1
  *
- *  Usage:  dgcunp [-l] [-v] [-o outdir] <archive>
+ *  Usage:  dgcunp [-l] [-v] [-p<password> | -k<keyfile>] [-o outdir] <archive>
  * ------------------------------------------------------------------ */
 
 #include <stdio.h>
@@ -1104,6 +1104,39 @@ static void crypt_setkey_fixed(crypt_t *c)
     crypt_setkey(c, zero, 8, (const u8 *)"SecureCryptograph", 17);
 }
 
+/* ------------------------------------------------------------------ *
+ *  The encryption of the ARCHIVE ITSELF (-p / -k)
+ *
+ *  The writer encrypts every DGCC record (the 32 byte chunk header AND
+ *  its payload) and the 48 bytes of the IARC payload at +0x20.  Two
+ *  different keys are used:
+ *
+ *    key1 = SHA-512( 8 zero bytes | password )  stretched over 39 rounds
+ *           -> the 32 byte chunk header and the IARC's +0x20 area
+ *    key2 = SHA-512( the PLAINTEXT header | password )  stretched
+ *           -> the chunk's payload
+ *
+ *  The password is the text given with -p.  With -k it is the hex text
+ *  of the SHA-512 of the key file (the standard digest, 128 characters).
+ * ------------------------------------------------------------------ */
+
+/* the password of an archive, as the writer sees it */
+static u8  g_pw[256];
+static u32 g_pwlen;
+static int g_encrypted;
+
+static void crypt_setkey_pw1(crypt_t *c, const u8 *pw, u32 pwlen)
+{
+    static const u8 zero[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    crypt_setkey(c, zero, 8, pw, pwlen);
+}
+
+static void crypt_setkey_pw2(crypt_t *c, const u8 *hdr, u32 hlen,
+                             const u8 *pw, u32 pwlen)
+{
+    crypt_setkey(c, hdr, hlen, pw, pwlen);
+}
+
 /* the self test: the key stream of the fixed key */
 static int crypto_selftest(void)
 {
@@ -1124,6 +1157,125 @@ static int crypto_selftest(void)
     for (i = 0; i < 64; i++) printf("%02x", buf[i]);
     printf("\n");
     return 0;
+}
+
+/* the chunk CRC fields: the CRC of the payload and the CRC of the
+ * 32 byte header with the header CRC field set to zero.  The header CRC
+ * is computed AFTER the payload CRC has been written (the header CRC
+ * covers the payload CRC field). */
+static void chunk_fix_crc(chunk_t *c)
+{
+    u8 *h = g_img + c->off;
+    u8 tmp[32];
+    u32 v;
+    v = crc32_buf(g_img + c->off + 32, c->psize);
+    memcpy(h + 24, &v, 4);
+    memcpy(tmp, h, 32);
+    memset(tmp + 28, 0, 4);
+    v = crc32_buf(tmp, 32);
+    memcpy(h + 28, &v, 4);
+}
+
+/* ------------------------------------------------------------------ *
+ *  The decryption of an encrypted archive
+ *
+ *  The encrypted regions are:
+ *    - every DGCC record: the 32 byte header and its payload;
+ *    - the 48 bytes of the IARC payload at +0x20.
+ *  The chunk headers of the outer levels (DGCA / DATA / INFO / IARC /
+ *  IFDT / IFNM) are NOT encrypted, so the tree can be walked; only the
+ *  DGCC records have to be decrypted one by one.
+ *
+ *  The CRCs of the chunks are computed over the CIPHERTEXT, so they
+ *  have to be recomputed after the decryption.
+ * ------------------------------------------------------------------ */
+
+/* decrypt the DGCC records of one container (DATA / IFDT / IFNM) */
+static void decrypt_dgcc_records(u32 off, u32 end)
+{
+    u32 p = off;
+    crypt_t c1, c2;
+    while (p + 32 <= end) {
+        u8 hdr[32];
+        u32 ps;
+        crypt_setkey_pw1(&c1, g_pw, g_pwlen);
+        crypt_decrypt(&c1, g_img + p, 32);
+        memcpy(hdr, g_img + p, 32);
+        if (memcmp(hdr, "DGCC", 4)) {
+            /* not a DGCC record: restore the header and stop */
+            crypt_setkey_pw1(&c1, g_pw, g_pwlen);
+            crypt_encrypt(&c1, g_img + p, 32);
+            return;
+        }
+        ps = rd32(hdr + 8);
+        if (p + 32 + ps > end) return;
+        crypt_setkey_pw2(&c2, hdr, 32, g_pw, g_pwlen);
+        crypt_decrypt(&c2, g_img + p + 32, ps);
+        p = align16(p + 32 + ps);
+    }
+}
+
+/* decrypt the whole archive in place.  Returns 0 if the password is
+ * obviously wrong (the decrypted IARC does not look sane). */
+static int decrypt_archive(void)
+{
+    crypt_t c;
+    int i;
+    /* the DGCC records of the containers */
+    for (i = 0; i < g_nchunk; i++) {
+        chunk_t *k = &g_chunks[i];
+        if (!strcmp(k->id, "DATA") || !strcmp(k->id, "IFDT") || !strcmp(k->id, "IFNM"))
+            decrypt_dgcc_records(k->off + 32, k->off + 32 + k->psize);
+    }
+    /* the IARC payload's +0x20 area (48 bytes) */
+    for (i = 0; i < g_nchunk; i++) {
+        chunk_t *k = &g_chunks[i];
+        if (!strcmp(k->id, "IARC") && k->psize >= 0x50) {
+            crypt_setkey_pw1(&c, g_pw, g_pwlen);
+            crypt_decrypt(&c, g_img + k->off + 32 + 0x20, 48);
+            /* the number of entries and the name blob length must be
+             * plausible - a wrong password gives garbage */
+            if (rd64(g_img + k->off + 32 + 0x28) > 0x1000000UI64 ||
+                rd32(g_img + k->off + 32 + 0x40) > 0x1000000u)
+                return 0;
+            break;
+        }
+    }
+    return 1;
+}
+
+/* the password of a -k key file: the hex text of the SHA-512 of its
+ * content.  The binary formats the state word by word: the HIGH dword
+ * first, then the low one - that is the standard SHA-512 digest. */
+static int password_from_keyfile(const char *path, u8 *out, u32 outmax)
+{
+    u8 *buf;
+    u32 n, i, g, j;
+    sha512_t h;
+    u8 st[64];
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "cannot open the key file %s\n", path); return 0; }
+    fseek(f, 0, SEEK_END); n = (u32)ftell(f); fseek(f, 0, SEEK_SET);
+    buf = (u8 *)malloc((size_t)n + 1);
+    if (!buf) { fclose(f); fprintf(stderr, "oom\n"); return 0; }
+    if (fread(buf, 1, n, f) != n) { fclose(f); free(buf); fprintf(stderr, "read error\n"); return 0; }
+    fclose(f);
+    sha512_init(&h);
+    sha512_update(&h, buf, n);
+    sha512_final(&h);
+    sha512_state(&h, st);
+    free(buf);
+    if (outmax < 129) return 0;
+    /* the state holds every 64 bit word with its low dword first: the
+     * digest (and its hex text) needs the bytes of every group in
+     * reverse order */
+    for (g = 0; g < 8; g++)
+        for (i = 0; i < 8; i++) {
+            j = g * 8 + i;
+            sprintf((char *)out + j * 2, "%02x", st[g * 8 + 7 - i]);
+        }
+    out[128] = 0;
+    return 128;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1369,14 +1521,17 @@ static u8 *slurp(const char *path, u32 *size){
 static void usage(void)
 {
     printf("dgcunp - DGC archive unpacker / lister (format of DGCA v1.10)\n"
-           "usage: dgcunp [-v] [-l] [-R] [-o outdir] <archive.dgc>\n"
-           "  -R   repair a damaged archive with its recovery data (the DGCR chunk)\n");
+           "usage: dgcunp [-v] [-l] [-R] [-p<password> | -k<keyfile>] [-o outdir] <archive.dgc>\n"
+           "  -R   repair a damaged archive with its recovery data (the DGCR chunk)\n"
+           "  -p   the password of an encrypted archive (-p secret)\n"
+           "  -k   the key file of an encrypted archive (-k mykey.key)\n");
     exit(1);
 }
 
 int main(int argc, char **argv)
 {
-    const char *path = NULL, *outdir = NULL;
+    const char *path = NULL, *outdir = NULL, *keyfile = NULL;
+    const char *pwarg = NULL;
     int verbose = 0, listonly = 0, repair = 0, i;
     chunk_t *info, *data, *ifdt, *ifnm, *iarc;
     const u8 *iarcpay;
@@ -1386,14 +1541,70 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "-v")) verbose = 1;
         else if (!strcmp(argv[i], "-l")) listonly = 1;
         else if (!strcmp(argv[i], "-R")) repair = 1;
+        else if (!strncmp(argv[i], "-p", 2) && argv[i][2]) pwarg = argv[i] + 2;
+        else if (!strncmp(argv[i], "-k", 2) && argv[i][2]) keyfile = argv[i] + 2;
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) outdir = argv[++i];
         else if (argv[i][0] == '-') usage();
         else path = argv[i];
     }
     if (!path) usage();
 
+    if (pwarg) {
+        g_pwlen = (u32)strlen(pwarg);
+        if (g_pwlen > sizeof(g_pw)) g_pwlen = sizeof(g_pw);
+        memcpy(g_pw, pwarg, g_pwlen);
+    } else if (keyfile) {
+        g_pwlen = password_from_keyfile(keyfile, g_pw, sizeof(g_pw));
+        if (!g_pwlen) return 1;
+    }
+
     g_img = slurp(path, &g_imgsize);
     walk(0, g_imgsize, 0, NULL);
+
+    /* The recovery data (the DGCR chunk) covers the archive AS IT IS
+     * STORED - i.e. the encrypted bytes of an encrypted archive.  So the
+     * recovery has to be handled before the decryption. */
+    {
+        chunk_t *dgcr = find_chunk("DGCR", 0);
+        if (dgcr) {
+            printf("\n");
+            dgcr_report(dgcr, verbose);
+            if (repair) dgcr_repair(dgcr, path, verbose);
+        }
+    }
+
+    /* is the archive encrypted?  The IARC's flags have bit 0 set. */
+    {
+        chunk_t *k = find_chunk("IARC", 2);
+        if (k && k->psize >= 4 && (rd32(g_img + k->off + 32) & 1)) {
+            g_encrypted = 1;
+            if (!g_pwlen) {
+                printf("\n*** this archive is ENCRYPTED (-p / -k).\n"
+                       "    Use -p<password> or -k<keyfile> to decrypt it.\n");
+                return 1;
+            }
+            printf("\n*** the archive is encrypted - decrypting it\n");
+            if (!decrypt_archive()) {
+                printf("*** the password is wrong (the decrypted index is garbage)\n");
+                return 1;
+            }
+            /* the tree has to be walked again: the DGCC headers were
+             * encrypted and are readable now */
+            g_nchunk = 0;
+            g_broken = 0;
+            walk(0, g_imgsize, 0, NULL);
+            /* the CRCs were computed over the ciphertext: recompute them
+             * (now that the whole tree is known).  The deepest chunks
+             * first: a container's CRC covers its children's bytes. */
+            {
+                int k, d;
+                for (d = 4; d >= 0; d--)
+                    for (k = 0; k < g_nchunk; k++)
+                        if ((int)g_chunks[k].depth == d) chunk_fix_crc(&g_chunks[k]);
+            }
+            g_encrypted = 0;
+        }
+    }
 
     printf("file      : %s (%u bytes)\n", path, g_imgsize);
     printf("chunks    : %d\n", g_nchunk);
@@ -1423,7 +1634,7 @@ int main(int argc, char **argv)
                (const char *)iarcpay + 4, rd32(iarcpay),
                (unsigned)(u32)rd64(iarcpay + 0x28), (unsigned)(u32)rd64(iarcpay + 0x30),
                (unsigned)(u32)rd64(iarcpay + 0x38), rd32(iarcpay + 0x40));
-        if (rd32(iarcpay) & 1) {
+        if (g_encrypted) {
             printf("\n*** this archive is ENCRYPTED (-p / -k).\n"
                    "    The crypto of DGCA v1.10 is known (see NOTES-dgca-format.md),\n"
                    "    but the key material that the writer derives is not stored in the\n"
@@ -1436,15 +1647,6 @@ int main(int argc, char **argv)
     }
     if (g_broken)
         printf("\n*** the chunk tree is broken (an encrypted archive?)\n");
-
-    {
-        chunk_t *dgcr = find_chunk("DGCR", 0);
-        if (dgcr) {
-            printf("\n");
-            dgcr_report(dgcr, verbose);
-            if (repair) dgcr_repair(dgcr, path, verbose);
-        }
-    }
 
     if (ifdt) parse_index(ifdt);
     if (ifnm) parse_names(ifnm);

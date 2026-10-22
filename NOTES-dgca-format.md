@@ -365,12 +365,12 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
 
 8. ENCRYPTION (-p password / -k keyfile)
 ----------------------------------------
-  The CRYPTO IS NOW CRACKED (2026-10-22) and implemented in dgcunp.c
-  (the SHA-512, the MT19937 variant, the PRNG, the cipher and the key
-  derivation are byte exact - VERIFIED against the original binary, see
-  section 8.6).  What is still missing is the KEY MATERIAL that the
-  writer derives (section 8.7), so an encrypted archive cannot be
-  decrypted yet.
+  THE ENCRYPTION IS FULLY CRACKED (2026-10-22) and implemented in
+  dgcunp.c (the SHA-512, the MT19937 variant, the PRNG, the cipher and
+  the key derivation are byte exact - VERIFIED against the original
+  binary, see section 8.6).  An encrypted archive can be decrypted with
+  `dgcunp -p<password>` or `dgcunp -k<keyfile>`; the extracted files are
+  byte identical to the ones dgcac.exe extracts.
 
   Cipher (sub_421C30 encrypt / sub_421C80 decrypt), a self inverse XOR
   stream with one feedback byte:
@@ -488,17 +488,18 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       * the whole DGCC chunk (the 32 byte header + the payload) is encrypted
         as ONE unit - the chunk's ID and its size are encrypted too, so the
         reader must decrypt the header before it can walk the tree;
-      * the cipher is NOT reset between the chunks: the keystream runs on
-        over the whole archive (MEASURED: the keystreams of the DATA, the
-        IFDT and the IFNM chunk differ from the very first byte - the old
-        note that they share their first 9 bytes was wrong);
-      * every other chunk has only the header bytes 0x18..0x1F encrypted;
       * inside the IARC payload the bytes 0x20..0x4F are encrypted and
-        the flags' bit 0 is set.
+        the flags' bit 0 is set;
+      * the chunk headers of the outer levels (DGCA / DATA / INFO / IARC /
+        IFDT / IFNM) are NOT encrypted - only their CRC fields differ
+        (the CRCs are computed over the CIPHERTEXT);
+      * the DGCR chunk (the recovery data) is not encrypted either, but it
+        covers the archive AS IT IS STORED, i.e. the encrypted bytes - so
+        the recovery check has to run BEFORE the decryption.
 
   A test pair for this: `dgcac a plain.dgc src` vs
   `dgcac a -p secret enc.dgc src` - the two files differ only at the chunk
-  header CRC fields and in the DGCC chunk.
+  header CRC fields, in the DGCC chunks and in the IARC payload.
 
   8.6  THE VERIFICATION OF THE CRYPTO
   -----------------------------------
@@ -516,45 +517,57 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       and against the real data: the recovery table of a .dgcr file
       decrypts to the archive's bytes (see section 7).
 
-  8.7  WHAT IS STILL MISSING: THE KEY MATERIAL
-  --------------------------------------------
-      The writer derives a 96 byte key material (the "Buffer" of
-      sub_40AE90, built at 0x40B64D and 0x40CCBE) and uses it as the
-      first half of the key derivation:
-          key = SHA-512(material || password) stretched over 39 rounds
-      The material is (the offsets are into the 96 bytes):
-          +0x00  the flags (1 = encrypted)
-          +0x04  the high dword of a block count
-          +0x08  the low dword of the block count
-          +0x0C  0
-          +0x10  the high dword of B (max(the file size, the divisor))
-          +0x14  the low dword of B
-          +0x18  the low dword of the file size
-          +0x1C  the high dword of the file size
-          +0x20  64 bytes: the SHA-512 state of some file
-      The last 64 bytes are filled by the object's vtable entry +0x18
-      (a "hash a file" function) - the name of the file it hashes comes
-      from an UNINITIALISED stack slot of the writer (the buffer that
-      receives the hash is passed to it as a std::string), so it is the
-      leftover of an earlier call.  In the -k mode it is the key file
-      (MEASURED: two key files with the same content but different
-      names give the same key stream), in the -p mode it is a file with
-      an empty content (the same key stream for every archive).
+  8.7  THE TWO KEYS OF AN ENCRYPTED ARCHIVE
+  ------------------------------------------
+      There is NO 96 byte key material in an archive: the old note about
+      it was a misinterpretation of the writer's code.  The writer
+      (sub_40AE90) uses TWO different keys, both derived from the
+      PASSWORD alone:
 
-      The reader (sub_40FDB0) uses the first 32 bytes of the DECRYPTED
-      chunk header as the material - which is not what the writer
-      does.  That is the bug of the CLI: the writer and the reader
-      derive different keys, and the password is never checked (the
-      check flag is never set).
+        key1 = SHA-512( 8 zero bytes | password )   stretched over 39
+                rounds
+        key2 = SHA-512( the 32 byte PLAINTEXT chunk header | password )
+                stretched over 39 rounds
 
-      => to decrypt an archive one needs the 96 byte material.  The
-      crypto is known, the material's derivation is not (yet).
+      and uses them like this:
+        * the 32 byte header of every DGCC record is encrypted with
+          key1 (the "verify" key of sub_421EE0 - the same derivation
+          the SecureCryptograph class uses for its password check);
+        * the payload of that DGCC record is encrypted with key2, i.e.
+          the key depends on the PLAINTEXT header of its own chunk;
+        * the 48 bytes of the IARC payload at +0x20 are encrypted with
+          key1.
+
+      The reader (sub_40A100 / sub_40FDB0) does exactly the same, so
+      the writer and the reader agree - the CLI has no bug here (the
+      old note claimed otherwise).
+
+      The PASSWORD is:
+        * the text after -p, used as it is;
+        * with -k: the hex TEXT of the SHA-512 of the key file's
+          content.  The binary formats the state word by word - the
+          HIGH dword first, then the low one - which is exactly the
+          standard SHA-512 digest, so the password is the usual
+          128 character hex digest of the key file (MEASURED: two key
+          files with the same content but different names give the same
+          key stream).
+
+      The key derivation is the one of section 8.2: the data comes
+      first, then the password:
+          SHA-512( data | password ) stretched over 39 rounds
+      and the stretch seeds the MT19937.
+
+      dgcunp implements this: `-p<password>` or `-k<keyfile>` decrypts
+      the archive in memory, the CRCs are then recomputed (they were
+      computed over the ciphertext) and the files are extracted.
+
 
 
 9. TOOL
 -------
   dgcunp.c   MSVC6, C89.  -l list, -v verbose, -R repair, -o outdir
-  extract, -t the crypto's self test.
+             extract, -t the crypto's self test, -p<password> / -k<keyfile>
+             decrypt an encrypted archive.
   works: container parse, CRC verify, IARC, the index (stored AND
          compressed), the name list (stored AND compressed), the data area
          (stored, compressed, solid and the column method) - every
@@ -566,9 +579,11 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
          section 8) and the recovery data: -R decodes the DGCR chunk,
          repairs the damaged words with the parity table and writes
          "<archive>.repaired".
-  open: the encryption of the archives (-p / -k): the crypto is known
-        but the key material that the writer derives is not (8.7), and
-        the match coder (the params' bit 1).
+  works: the encryption of the archives (-p / -k): -p<password> or
+         -k<keyfile> decrypts the archive in memory (the two keys of
+         section 8.7) and the extracted files are byte identical to the
+         ones dgcac.exe extracts.
+  open: the match coder (the params' bit 1).
 
   dgcpk.c   MSVC6, C89.  the PACKER (the archiver):
          dgcpk a [-n] [-f] [-i] [-r<n>] <archive> <file>...

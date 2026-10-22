@@ -195,6 +195,8 @@ copy the `.exe` back, or map a drive letter first.)
 dgcunp.exe -v archive.dgc            # dump the chunk tree + CRC status
 dgcunp.exe archive.dgc                # list the entries
 dgcunp.exe -o outdir archive.dgc      # extract
+dgcunp.exe -psecret archive.dgc      # extract an encrypted archive (-p)
+dgcunp.exe -kmykey.key archive.dgc   # ... or with a key file (-k)
 dgcunp.exe -R archive.dgcr           # repair it with its recovery data
 dgcunp.exe -t                        # the crypto's self test
 ```
@@ -215,7 +217,7 @@ Current state of `dgcunp.c`:
 | the crypto of DGCA v1.10 (SHA-512, MT19937, PRNG, cipher, key derivation) | working - byte exact, verified against the original binary |
 | the recovery data (`-R`): the parity table, the repair, the archive's CRC-32 | working - a damaged `.dgcr` is repaired and extracted without errors |
 | the packer (`dgcpk.c`) | working - `dgcac.exe` reads back the archives it writes and the extracted files are byte identical |
-| encrypted archives | the crypto is known, the key material that the writer derives is not (see `NOTES-dgca-format.md` 8.7) |
+| encrypted archives (`-p` / `-k`) | working - the two keys are cracked (see `NOTES-dgca-format.md` 8.7); the extracted files are byte identical to `dgcac.exe`'s |
 | the match coder (the params' bit 1) | not implemented (unused by the sample archives) |
 
 The regression test: extract every archive in the work area and check that
