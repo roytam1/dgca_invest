@@ -47,13 +47,18 @@ static void crc_init(void)
     crc_ready = 1;
 }
 
-static u32 crc32_buf(const u8 *p, u32 n)
+static u32 crc32_update(u32 crc, const u8 *p, u32 n)
 {
-    u32 c = 0xFFFFFFFFu, i;
+    u32 i;
     if (!crc_ready) crc_init();
     for (i = 0; i < n; i++)
-        c = crc_tab[(c ^ p[i]) & 0xFF] ^ (c >> 8);
-    return c ^ 0xFFFFFFFFu;
+        crc = crc_tab[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+    return crc;
+}
+
+static u32 crc32_buf(const u8 *p, u32 n)
+{
+    return crc32_update(0xFFFFFFFFu, p, n) ^ 0xFFFFFFFFu;
 }
 
 /* ----------------------------- the buffer ----------------------------- */
@@ -768,8 +773,8 @@ static void put_chunk(buf_t *out, const char *id, u32 flags, const u8 *payload,
     hdr[10] = (u8)(plen >> 16); hdr[11] = (u8)(plen >> 24);
     hdr[12] = hdr[13] = hdr[14] = hdr[15] = 0;          /* zero_0c */
     hdr[16] = (u8)flags; hdr[17] = (u8)(flags >> 8);
-    hdr[18] = hdr[19] = hdr[20] = hdr[21] = 0;
-    hdr[20] = 1; hdr[21] = hdr[22] = hdr[23] = 0;      /* the version */
+    hdr[18] = hdr[19] = 0;
+    hdr[20] = 0x10; hdr[21] = hdr[22] = hdr[23] = 0;   /* the alignment */
     crc = crc32_buf(payload, plen);
     hdr[24] = (u8)crc; hdr[25] = (u8)(crc >> 8);
     hdr[26] = (u8)(crc >> 16); hdr[27] = (u8)(crc >> 24);
@@ -826,6 +831,20 @@ typedef struct {
  *  with zeros), part 1 is the column parity, part 2 the row parity and
  *  part 3 the offsets of the row blocks.  The whole thing is encrypted
  *  with the fixed key of the SecureCryptograph class. */
+
+/* the rows and the pages of the matrix (the same formula as the tool) */
+static void recovery_params(u32 size, int level, u32 *rows, u32 *pages)
+{
+    u32 cols = 256, r, p;
+    r = (u32)(((u64)size + ((u64)(cols >> (level - 1)) * 1024) - 1) /
+              ((u64)(cols >> (level - 1)) * 1024));
+    if (r < 4) r = 4;
+    p = (u32)(((u64)size + (u64)r * 1024 - 1) / ((u64)r * 1024));
+    if (p == 1) r = (size + 1023) / 1024;
+    *rows = r;
+    *pages = p;
+}
+
 static void recovery_data(const u8 *arch, u32 size, int level, buf_t *out)
 {
     u32 rows, pages, cols = 256, i, j, k, words;
@@ -833,11 +852,7 @@ static void recovery_data(const u8 *arch, u32 size, int level, buf_t *out)
     buf_t plain;
     crypt_t c;
 
-    rows = (u32)(((u64)size + ((u64)(cols >> (level - 1)) * 1024) - 1) /
-                 ((u64)(cols >> (level - 1)) * 1024));
-    if (rows < 4) rows = 4;
-    pages = (u32)(((u64)size + (u64)rows * 1024 - 1) / ((u64)rows * 1024));
-    if (pages == 1) rows = (size + 1023) / 1024;
+    recovery_params(size, level, &rows, &pages);
     words = rows * cols * pages;
 
     memset(&plain, 0, sizeof(plain));
@@ -863,10 +878,24 @@ static void recovery_data(const u8 *arch, u32 size, int level, buf_t *out)
             }
         }
     }
-    /* the offsets of the row blocks (part 3) */
+    /* part 3: the CRC-32 of every row of the matrix (the words of the
+     * row over all the pages) */
     for (i = 0; i < rows; i++) {
-        u32 v = i * cols * pages * 4;
-        memcpy(off + i * 4, &v, 4);
+        u32 c = 0xFFFFFFFFu;
+        u8 tmp[4];
+        for (k = 0; k < pages; k++) {
+            for (j = 0; j < cols; j++) {
+                u32 idx = (k * rows + i) * cols + j;
+                u32 w = 0;
+                if (idx < words && (u64)idx * 4 + 4 <= size)
+                    w = ((const u32 *)arch)[idx];
+                tmp[0] = (u8)w; tmp[1] = (u8)(w >> 8);
+                tmp[2] = (u8)(w >> 16); tmp[3] = (u8)(w >> 24);
+                c = crc32_update(c, tmp, 4);
+            }
+        }
+        c ^= 0xFFFFFFFFu;
+        memcpy(off + i * 4, &c, 4);
     }
     bput(&plain, par, rows * cols * 4);
     bput(&plain, rowx, pages * rows * 4);
@@ -880,6 +909,316 @@ static void recovery_data(const u8 *arch, u32 size, int level, buf_t *out)
     crypt_encrypt(&c, plain.p, plain.len);
     bput(out, plain.p, plain.len);
     free(plain.p);
+}
+
+/* ------------------------- the spanning files ------------------------- *
+ *  A big file can be split into parts; every part is a chunk tree of its
+ *  own and the parts are named <base>%04d.dgd:
+ *
+ *      DGCD
+ *      |-- INFO  (116 bytes)  the material (96 bytes) + the name
+ *      |-- DFDT  (32 bytes)   the CRC-32 of the whole file + the FILETIME
+ *      `-- DATA  (the part's bytes - they are NOT compressed)
+ *
+ *  The material (96 bytes):
+ *      +0x00 u32  the flags (bit 0 = encrypted)
+ *      +0x04 u32  the index of the part
+ *      +0x08 u32  the number of the parts
+ *      +0x10 u32  the size of this part
+ *      +0x18 u32  the size of the whole file
+ *      +0x20 64B  the SHA-512 of the whole file
+ *  The name (at INFO+0x60) is the name of the file that is split.
+ *
+ *  With the recovery data the same parts are also written as
+ *  <base>%04d.dgdr: the DATA chunk of the first part is then shorter (the
+ *  recovery data needs the room) and a DGCR chunk with the parity table
+ *  is appended; the other parts hold the rest of the file.
+ *
+ *  The crypto is the archive's: key1 = SHA-512(8 zeros | password) for
+ *  the 92 bytes of the material at +4 and key2 = SHA-512(the PLAINTEXT
+ *  material | password) for the name, the DFDT and the DATA (each of
+ *  them with its own key stream).
+ * ------------------------------------------------------------------ */
+
+/* the overhead of the DGCR chunk: its header (32) + the INFO chunk (32 +
+ * 48) + the DATA chunk's header (32) + the trailing chunk (32) */
+#define DGCR_OVERHEAD 176
+
+static int write_file(const char *path, const u8 *data, u32 len)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "cannot write %s\n", path); return 0; }
+    if (len && fwrite(data, 1, len, f) != len) {
+        fprintf(stderr, "write error\n");
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return 1;
+}
+
+/* the password of a -k key file: the hex text of the SHA-512 of the
+ * content of the file (the standard digest, 128 characters) */
+static u32 password_from_keyfile(const char *path, u8 *out, u32 outmax)
+{
+    u8 *buf;
+    u32 n, i, g, j;
+    sha512_t h;
+    u8 st[64];
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "cannot open %s\n", path); return 0; }
+    fseek(f, 0, SEEK_END);
+    n = (u32)ftell(f);
+    fseek(f, 0, SEEK_SET);
+    buf = (u8 *)malloc(n ? n : 1);
+    if (!buf) { fclose(f); return 0; }
+    if (n && fread(buf, 1, n, f) != n) { fclose(f); free(buf); return 0; }
+    fclose(f);
+    sha512_init(&h);
+    sha512_update(&h, buf, n);
+    sha512_final(&h);
+    sha512_state(&h, st);
+    free(buf);
+    if (outmax < 129) return 0;
+    /* the state holds every 64 bit word with its low dword first: the
+     * digest (and its hex text) needs the bytes of every group in
+     * reverse order */
+    for (g = 0; g < 8; g++)
+        for (i = 0; i < 8; i++) {
+            j = g * 8 + i;
+            sprintf((char *)out + j * 2, "%02x", st[g * 8 + 7 - i]);
+        }
+    out[128] = 0;
+    return 128;
+}
+
+/* the parameters of one spanning file */
+typedef struct {
+    const u8 *data;       /* the whole file */
+    u32 totalsize;
+    const u8 *st;         /* the SHA-512 of the whole file */
+    const u8 *dfdt;       /* the 32 bytes of the DFDT */
+    const char *name;
+    u32 namelen;
+    u32 partidx, nparts;
+    const u8 *pw;
+    u32 pwlen;
+} span_t;
+
+/* write one part of a spanning file (.dgd or .dgdr) */
+static int span_write_part(const span_t *S, const char *path, u32 doff,
+                            u32 dlen, int recovery, int level)
+{
+    u8 mat[96], info[96 + 4 + 1024], edfdt[32], *edata;
+    u32 ilen, v;
+    buf_t kids, out;
+    crypt_t c;
+    static const u8 zeros8[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+
+    /* the material (the plain text one) */
+    memset(mat, 0, 96);
+    v = S->pwlen ? 1u : 0u;  memcpy(mat + 0x00, &v, 4);
+    v = S->partidx;          memcpy(mat + 0x04, &v, 4);
+    v = S->nparts;           memcpy(mat + 0x08, &v, 4);
+    v = dlen;                memcpy(mat + 0x10, &v, 4);
+    v = S->totalsize;        memcpy(mat + 0x18, &v, 4);
+    memcpy(mat + 0x20, S->st, 64);
+
+    /* the INFO payload: the material + the name */
+    ilen = 96 + 4 + S->namelen;
+    memset(info, 0, ilen);
+    memcpy(info, mat, 96);
+    memcpy(info + 96, &S->namelen, 4);
+    memcpy(info + 100, S->name, S->namelen);
+    if (S->pwlen) {
+        u8 encmat[96];
+        memcpy(encmat, mat, 96);
+        crypt_setkey(&c, zeros8, 8, S->pw, S->pwlen);
+        crypt_encrypt(&c, encmat + 4, 92);
+        memcpy(info, encmat, 96);
+        crypt_setkey(&c, mat, 96, S->pw, S->pwlen);
+        crypt_encrypt(&c, info + 96, 4 + S->namelen);
+    }
+    /* the DFDT */
+    memcpy(edfdt, S->dfdt, 32);
+    if (S->pwlen) {
+        crypt_setkey(&c, mat, 96, S->pw, S->pwlen);
+        crypt_encrypt(&c, edfdt, 32);
+    }
+    /* the DATA (the part's bytes, not compressed) */
+    edata = (u8 *)malloc(dlen ? dlen : 1);
+    if (!edata) { fprintf(stderr, "out of memory\n"); exit(2); }
+    memcpy(edata, S->data + doff, dlen);
+    if (S->pwlen) {
+        crypt_setkey(&c, mat, 96, S->pw, S->pwlen);
+        crypt_encrypt(&c, edata, dlen);
+    }
+    memset(&kids, 0, sizeof(kids));
+    put_chunk(&kids, "INFO", 0, info, ilen);
+    put_chunk(&kids, "DFDT", 0, edfdt, 32);
+    put_chunk(&kids, "DATA", 0, edata, dlen);
+    free(edata);
+    memset(&out, 0, sizeof(out));
+    put_chunk(&out, "DGCD", 1, kids.p, kids.len);
+    free(kids.p);
+
+    /* the recovery data (the .dgdr) */
+    if (recovery) {
+        buf_t dgcr, rec;
+        u8 dgcrinfo[48];
+        u32 rows, pages, l;
+        recovery_params(out.len, level, &rows, &pages);
+        l = (rows * 256 + pages * rows + rows) * 4;
+        memset(&rec, 0, sizeof(rec));
+        recovery_data(out.p, out.len, level, &rec);
+        memset(dgcrinfo, 0, sizeof(dgcrinfo));
+        dgcrinfo[0] = 0x43;
+        memcpy(dgcrinfo + 4, &l, 4);
+        { u32 c2 = 256; memcpy(dgcrinfo + 0x10, &c2, 4); }
+        memcpy(dgcrinfo + 0x14, &rows, 4);
+        memcpy(dgcrinfo + 0x18, &pages, 4);
+        { u32 o = out.len, c3 = crc32_buf(out.p, out.len);
+          memcpy(dgcrinfo + 0x28, &o, 4);
+          memcpy(dgcrinfo + 0x2C, &c3, 4); }
+        memset(&dgcr, 0, sizeof(dgcr));
+        put_chunk(&dgcr, "INFO", 0, dgcrinfo, 48);
+        {
+            buf_t dat;
+            memset(&dat, 0, sizeof(dat));
+            put_chunk(&dat, "DATA", 0, rec.p, rec.len);
+            bput(&dgcr, dat.p, dat.len);
+            free(dat.p);
+        }
+        put_chunk(&out, "DGCR", 1, dgcr.p, dgcr.len);
+        free(dgcr.p);
+        free(rec.p);
+        /* the trailing chunk (the file is a multiple of 32 bytes) */
+        put_chunk(&out, "    ", 0, (const u8 *)"", 0);
+    }
+    if (!write_file(path, out.p, out.len)) { free(out.p); return 1; }
+    printf("  %s (%u bytes)\n", path, out.len);
+    free(out.p);
+    return 0;
+}
+
+/* write the spanning files of one file */
+static int write_spanning(const char *base, const char *file, u32 partsize,
+                          int recovery, const u8 *pw, u32 pwlen)
+{
+    u8 *data = NULL, st[64], dfdt[32];
+    u32 size = 0, i, nparts, namelen, crc, poff, plen;
+    u64 ft;
+    char name[512], path[1024];
+    FILE *f;
+    sha512_t h;
+    span_t S;
+
+    /* the file */
+    f = fopen(file, "rb");
+    if (!f) { fprintf(stderr, "cannot open %s\n", file); return 1; }
+    fseek(f, 0, SEEK_END);
+    { long l = ftell(f); if (l < 0) { fclose(f); return 1; } size = (u32)l; }
+    fseek(f, 0, SEEK_SET);
+    data = (u8 *)malloc(size ? size : 1);
+    if (!data) { fprintf(stderr, "out of memory\n"); return 2; }
+    if (size && fread(data, 1, size, f) != size) {
+        fprintf(stderr, "read error\n");
+        fclose(f);
+        return 1;
+    }
+    fclose(f);
+
+    /* the name of the file (with its extension) */
+    {
+        const char *b = strrchr(file, '\\');
+        const char *p = b ? b + 1 : file;
+        namelen = (u32)strlen(p);
+        if (namelen > sizeof(name) - 1) namelen = sizeof(name) - 1;
+        memcpy(name, p, namelen);
+        name[namelen] = 0;
+    }
+
+    /* the SHA-512 of the whole file, its CRC-32 and its time stamp */
+    sha512_init(&h);
+    sha512_update(&h, data, size);
+    sha512_final(&h);
+    sha512_state(&h, st);
+    crc = crc32_buf(data, size);
+    ft = file_time(file, 1);
+    memset(dfdt, 0, sizeof(dfdt));
+    memcpy(dfdt + 0x00, &crc, 4);
+    { u32 v = 32; memcpy(dfdt + 0x04, &v, 4); }
+    memcpy(dfdt + 0x10, &ft, 8);
+
+    /* the number of the parts */
+    if (!partsize) partsize = size ? size : 1;
+    nparts = (size + partsize - 1) / partsize;
+    if (!nparts) nparts = 1;
+
+    printf("%s: %u bytes, %u part(s) of %u bytes\n", file, size, nparts,
+           partsize);
+
+    memset(&S, 0, sizeof(S));
+    S.data = data;
+    S.totalsize = size;
+    S.st = st;
+    S.dfdt = dfdt;
+    S.name = name;
+    S.namelen = namelen;
+    S.pw = pw;
+    S.pwlen = pwlen;
+
+    /* the .dgd set */
+    for (i = 0; i < nparts; i++) {
+        S.partidx = i;
+        S.nparts = nparts;
+        poff = i * partsize;
+        plen = size - poff;
+        if (plen > partsize) plen = partsize;
+        sprintf(path, "%s%04u.dgd", base, i);
+        if (span_write_part(&S, path, poff, plen, 0, 0)) return 1;
+    }
+    /* the .dgdr set: the first part is shorter (the recovery data needs
+     * the room), the other parts hold the rest of the file */
+    if (recovery) {
+        u32 dstart = 0, dlen, reclen = 0, off, rows, pages, k, dnparts = 1;
+        /* the size of the parity table (it depends on the size of the
+         * file, which depends on the size of the parity table) */
+        for (k = 0; k < 16; k++) {
+            u32 l;
+            dlen = (partsize > DGCR_OVERHEAD + reclen) ?
+                   partsize - DGCR_OVERHEAD - reclen : 0;
+            off = 288 + dlen;
+            recovery_params(off, recovery, &rows, &pages);
+            l = (rows * 256 + pages * rows + rows) * 4;
+            if (l == reclen) break;
+            reclen = l;
+        }
+        dlen = (partsize > DGCR_OVERHEAD + reclen) ?
+               partsize - DGCR_OVERHEAD - reclen : 0;
+        while (dstart + dlen < size) {
+            u32 rest = size - (dstart + dlen);
+            dstart += dlen;
+            dlen = rest > partsize ? partsize : rest;
+            dnparts++;
+        }
+        dstart = 0;
+        dlen = (partsize > DGCR_OVERHEAD + reclen) ?
+               partsize - DGCR_OVERHEAD - reclen : 0;
+        for (i = 0; i < dnparts; i++) {
+            S.partidx = i;
+            S.nparts = dnparts;
+            sprintf(path, "%s%04u.dgdr", base, i);
+            if (span_write_part(&S, path, dstart, dlen, 1, recovery)) return 1;
+            dstart += dlen;
+            {
+                u32 rest = size - dstart;
+                dlen = rest > partsize ? partsize : rest;
+            }
+        }
+    }
+    free(data);
+    return 0;
 }
 
 /* ------------------------- the directory tree ------------------------- */
@@ -958,10 +1297,18 @@ static void usage(void)
 {
     printf("dgcpk - the DGC archiver (the format of DGCA v1.10)\n"
            "usage: dgcpk a [-n] [-f] [-i] [-r<n>] <archive> <file>...\n"
+           "       dgcpk s [-S<n>] [-p<password>|-k<keyfile>] [-r<n>] <base> <file>\n"
            "  -n   do not compress\n"
            "  -f   one block per file\n"
            "  -i   identity: do not write the time stamps\n"
-           "  -r<n>  append the recovery data (the parity table)\n");
+           "  -r<n>  append the recovery data (the parity table)\n"
+           "  -S<n>  the size of a part of a spanning file (in bytes)\n"
+           "  -p   the password of an encrypted spanning file (-p secret)\n"
+           "  -k   the key file of an encrypted spanning file (-k mykey.key)\n"
+           "\n"
+           "  the command s writes the spanning files of a big file:\n"
+           "  <base>0000.dgd, <base>0001.dgd, ... (and with -r the same\n"
+           "  parts with the recovery data: <base>0000.dgdr, ...)\n");
     exit(1);
 }
 
@@ -970,7 +1317,11 @@ int main(int argc, char **argv)
     entry_t *ents;
     int nents = 0, i, j;
     int nocompress = 0, perfile = 0, identity = 0, recovery = 0;
-    const char *outpath = NULL;
+    int spanning = 0;
+    u32 partsize = 0;
+    const char *outpath = NULL, *inpath = NULL, *pwarg = NULL, *keyfile = NULL;
+    u8 pw[256];
+    u32 pwlen = 0;
     buf_t out, dgcchunk, infochunk;
     u8 *alldata = NULL;
     u32 alldatasize = 0, dgcsize = 0;
@@ -981,14 +1332,34 @@ int main(int argc, char **argv)
     if (argc > 2 && !strcmp(argv[1], "-T")) return test_mode(argv[2]);
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "a")) continue;
+        else if (!strcmp(argv[i], "s")) spanning = 1;
         else if (!strcmp(argv[i], "-n")) nocompress = 1;
         else if (!strcmp(argv[i], "-f")) perfile = 1;
         else if (!strcmp(argv[i], "-i")) identity = 1;
         else if (!strncmp(argv[i], "-r", 2)) recovery = atoi(argv[i] + 2);
+        else if (!strncmp(argv[i], "-S", 2)) partsize = (u32)strtoul(argv[i] + 2, NULL, 0);
+        else if (!strncmp(argv[i], "-p", 2) && argv[i][2]) pwarg = argv[i] + 2;
+        else if (!strncmp(argv[i], "-k", 2) && argv[i][2]) keyfile = argv[i] + 2;
         else if (argv[i][0] == '-') usage();
         else if (!outpath) outpath = argv[i];
+        else if (!inpath) inpath = argv[i];
     }
     if (!outpath) usage();
+
+    /* the spanning files: dgcpk s [switches] <base> <file> */
+    if (spanning) {
+        if (!inpath) usage();
+        if (pwarg) {
+            pwlen = (u32)strlen(pwarg);
+            if (pwlen > sizeof(pw) - 1) pwlen = sizeof(pw) - 1;
+            memcpy(pw, pwarg, pwlen);
+        } else if (keyfile) {
+            pwlen = password_from_keyfile(keyfile, pw, sizeof(pw));
+            if (!pwlen) return 1;
+        }
+        return write_spanning(outpath, inpath, partsize, recovery, pw, pwlen);
+    }
+
     ents = (entry_t *)calloc(argc, sizeof(entry_t));
     coff = (u32 *)calloc(argc, sizeof(u32));
     csize = (u32 *)calloc(argc, sizeof(u32));
