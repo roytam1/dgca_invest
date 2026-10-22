@@ -428,13 +428,54 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       is chosen by a CPUID check (sub_426980): with MMX/SSE the MMX version
       (sub_426B30), otherwise the scalar one (sub_4269E0).
 
-    8.4  SCOPE (measured by diffing an encrypted and a plain archive)
+    8.4  THE CLI'S ENCRYPTION IS BROKEN - THE GUI'S WORKS
+  ------------------------------------------------------
+  The GUI version (dgca.exe, in the work area root) has the SAME crypto
+  library (the same setKey = sub_46A610, the same MT19937, the same
+  SHA-512) and the same writer code (sub_451A90: v41 = 96, v40 = v57).
+  The difference is in the READER:
+
+      CLI  (sub_40FDB0):  sub_421CF0(..., this[122], 32)   <- 32 bytes!
+      GUI  (sub_452490):  sub_46A610(..., lpBuffer, 96)     <- 96 bytes
+
+  and in where the key material comes from: the GUI reads it from the
+  file -
+      v19 = sub_442D20(stream, lpBuffer, 0x60);   // 96 bytes!
+      if (v19 != 96) -> "read error"
+  - from the "DGCD" chunk (the one the CLI creates but never writes).
+
+  The GUI's reader (sub_452490) in full:
+      read 96 bytes -> lpBuffer                    (the key material)
+      read 32 bytes -> a3                         (the data)
+      if (lpBuffer[0] & 1) {                      // encrypted
+          setKey-and-verify(the password);
+          "decrypt"(lpBuffer + 4, 92);             // the check data
+          if (lpBuffer[3]) -> "wrong password";
+          setKey(lpBuffer, 96);                   // the real key
+          "decrypt"(a3, 32);
+      }
+
+  => to decrypt an archive made by the GUI one needs its 96 byte
+  material block (the DGCD chunk) and the password; the key is
+  SHA-512(material || password) stretched over 39 rounds and seeded into
+  the MT19937 exactly as in 8.2/8.3.
+
+  The CLI's own encrypted archives are unrecoverable: the writer and the
+  reader derive DIFFERENT keys and the material is never written.
+  MEASURED: "dgcac a -pmypass e.dgc f.bin" followed by
+  "dgcac e -pmypass out e.dgc" prints "Extraction process failed." - with
+  the RIGHT password (and the same with a wrong one: the password is not
+  even checked).  The GUI's version of the same archive works.
+
+    8.5  SCOPE (measured by diffing an encrypted and a plain archive)
   ----------------------------------------------------------------
       * the whole DGCC chunk (the 32 byte header + the payload) is encrypted
         as ONE unit - the chunk's ID and its size are encrypted too, so the
         reader must decrypt the header before it can walk the tree;
-      * the cipher is RESET for every chunk (the keystream's first 9 bytes
-        are the same for all the DGCC chunks of one file);
+      * the cipher is NOT reset between the chunks: the keystream runs on
+        over the whole archive (MEASURED: the keystreams of the DATA, the
+        IFDT and the IFNM chunk differ from the very first byte - the old
+        note that they share their first 9 bytes was wrong);
       * every other chunk has only the header bytes 0x18..0x1F encrypted;
       * inside the IARC payload the bytes 0x20..0x4F are encrypted and
         the flags' bit 0 is set.
