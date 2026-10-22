@@ -801,6 +801,32 @@ static void parse_names(chunk_t *ifnm)
     g_nametabsize = dec.len;
 }
 
+/* ------------------- the recovery record (the DGCR chunk) -------------------
+ * The DGCR chunk is appended after the DGCA chunk.  Its INFO chunk holds
+ * the recovery parameters and, at +0x2C, the CRC-32 of the whole archive
+ * (i.e. of everything in front of the DGCR chunk) - that is what the
+ * tool's "dgcac k" command verifies. */
+static void check_recovery(chunk_t *dgcr)
+{
+    chunk_t *info = child_chunk(dgcr, "INFO");
+    const u8 *ip;
+    u32 off, crc, c;
+    if (!info) { printf("recovery record: no INFO chunk\n"); return; }
+    if (info->psize < 0x30) { printf("recovery record: the INFO chunk is too small\n"); return; }
+    ip = g_img + info->off + 32;
+    off = rd32(ip + 0x28);
+    crc = rd32(ip + 0x2C);
+    if (off > g_imgsize) {
+        printf("recovery record: the archive offset %u is outside the file\n", off);
+        return;
+    }
+    c = crc32_buf(g_img, off);
+    printf("recovery record: %u bytes, %u columns, %u rows, %u pages, "
+           "the archive's checksum %08x %s\n",
+           rd32(ip + 4), rd32(ip + 0x10), rd32(ip + 0x14), rd32(ip + 0x18), c,
+           c == crc ? "ok" : "MISMATCH - the archive is DAMAGED");
+}
+
 /* ------------------- long / unicode paths -------------------
  * The names in the archive are UTF-8 and can be longer than MAX_PATH,
  * so the extraction uses the wide APIs with the "\\?\" prefix. */
@@ -957,6 +983,14 @@ int main(int argc, char **argv)
     }
     if (g_broken)
         printf("\n*** the chunk tree is broken (an encrypted archive?)\n");
+
+    {
+        chunk_t *dgcr = find_chunk("DGCR", 0);
+        if (dgcr) {
+            printf("\n");
+            check_recovery(dgcr);
+        }
+    }
 
     if (ifdt) parse_index(ifdt);
     if (ifnm) parse_names(ifnm);
