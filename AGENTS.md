@@ -200,8 +200,10 @@ The traps that cost the most time (do not repeat them):
 * the IFDT blob of a compressed archive differs from the blob of the stored twin (the
   "compressed size" field) - comparing the two is a false oracle.
 
-Still open: the match coder of the ENCODER (`sub_427D60` / `sub_427640`, the params' bit 1 -
-the decoder implements it, and the original's column method uses it for very uniform columns).
+Still open: nothing in the codec itself.  The remaining unknowns are the cosmetic fields
+of NOTES-dgca-format.md 6.7 (the block flags' bit 0, the IARC flags, the index entry's
+csize/offset) and the quality items (solid mode, the LZ iteration that does not settle on
+every input).
 
 
 ## 5. Build & test the unpacker
@@ -250,8 +252,9 @@ Current state of `dgcunp.c`:
 | encrypted archives (`-p` / `-k`) | working - the two keys are cracked (see `NOTES-dgca-format.md` 8.7); the extracted files are byte identical to `dgcac.exe`'s |
 | the spanning files (`.dgd` / `.dgdr`) | working - the parts are found in the directory, put together, checked against the SHA-512 of the INFO chunk and written out; `-R` applies the recovery data of a `.dgdr` |
 | the packer writes the spanning files too | working - `dgcpk s` writes byte identical `.dgd` / `.dgdr` files (the plain, the encrypted and the recovery variant) |
-| the match coder (the params' bit 1) | decoded (`cm_match`); not encoded by `dgcpk` |
-| the column method (tag 2) | decoded and encoded; the packer writes it when the lag test of `sub_423F90` fires, the columns without the LZ stage and without the match coder |
+| the match coder (the params' bit 1) | decoded (`cm_match`) and encoded (`cm_match_put`); the packer tries it per column |
+| the LZ stage (flags bit 1) | decoded (the chain walk) and encoded (the rank iteration of NOTES 6.2); the packer keeps the plain stream when the iteration does not settle |
+| the column method (tag 2) | decoded and encoded; the packer writes it when the lag test of `sub_423F90` fires, each column with the best of the literal/match coder and the LZ stage |
 
 The regression test: extract every archive in the work area and check that
 every file's CRC-32 matches the index:

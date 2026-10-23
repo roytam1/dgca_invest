@@ -318,18 +318,27 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
       bits 28-31   : this[13] - the model stream's shift (4)
   (the shifts are re-tuned per block by sub_4244E0)
 
-  6.7  WHAT IS STILL NOT KNOWN
+  6.7  WHAT IS STILL NOT KNOWN (AND WHAT IS NOW CLOSED)
   ----------------------------
-  * The MATCH coder of the ENCODER (sub_427D60 / sub_427640), used when
-    the params' bit 1 is set.  The DECODER is implemented in dgcunp.c
-    (cm_match) and handles it: the original's column method uses it for
-    the very uniform columns (spread(delta1) < 5, see 6.5), e.g. the
-    even columns of a 16 bit PCM file.  dgcpk.c does not encode it yet.
-  * The LZ stage of the PACKER: the forward permutation sub_428270 (the
-    inverse of the chain walk) is not implemented in dgcpk.c, so its
-    archives are bigger than the tool's on text and solid data.
-  * The encryption (-p / -k) is implemented in dgcunp.c and dgcpk.c
-    (section 8).
+  * The MATCH coder (the params' bit 1, sub_427D60 / sub_427640): the
+    decoder is cm_match in dgcunp.c and the encoder is cm_match_put in
+    dgcpk.c (byte exact against the original's uniform columns).  The
+    original picks it when spread(delta1) < 5 (6.5); dgcpk tries it and
+    keeps the smaller stream.
+  * The block flags' bit 0 (this[4]): the binary sets it on every
+    compressed block of the samples, the decoder ignores it and dgcpk
+    writes 0.
+  * The IARC flags: bit 0 = encrypted, bit 1 = the -i identity mode
+    (no time stamps); dgcpk writes 0 and both readers ignore the field.
+  * The index entry's "compressed size" and "offset" fields: dgcpk writes
+    the DGCC chunk's length and offset, the tool writes per-entry values
+    and 0; the extraction is sequential, so neither reader uses them.
+  * The column chooser's secondary test (the variance branch of
+    sub_423F90): dgcpk uses the main lag test and then compares the
+    column block with the plain one, which is stricter.
+  * The LZ stage's fixed point does not settle on every input (the delta
+    transformed columns of the 16 bit matrix, for example): dgcpk then
+    keeps the plain stream, the tool's cycle merge always finds one.
 
 
 7. -r RECOVERY DATA
@@ -675,9 +684,12 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
   * the column method: when the lag test of 6.5 fires, the block is
     written as a tag 2 (size = the stride) and every column is a tag 1
     with flags = the delta order << 16 (+ 2 when the column's LZ stage
-    settles), params 0x46443320, v7 = the column's length and no model
-    stream.  The plain tag 1 block is built as well and the smaller of the
-    two is kept (the tool does not compare - it trusts the lag test).
+    settles), params 0x46443320 (the literal coder) or 0x46443322 (the
+    match coder), v7 = the column's length and no model stream.  The
+    literal and the match coders are tried, each with and without the LZ
+    stage, and the smallest of the four is kept.  The plain tag 1 block
+    is built as well and the smaller of the two is kept (the tool does
+    not compare - it trusts the lag test).
   * the store fallback: when the compressed block is not smaller than
     the data + 8 bytes, the block is stored (tag 0), as the tool does.
   * the CM coder's context slot is BSR(state) with BSR(0) = 31.  The

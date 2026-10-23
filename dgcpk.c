@@ -713,6 +713,68 @@ static void cm_stream(const u8 *data, u32 n, u32 params, int firstbyte_zero,
     rng_flush(&e);
 }
 
+/* the "match" literal coder (the params' bit 1, sub_427D60): a plain 8 bit
+ * literal coder without the prepare/restore passes and without the run
+ * model.  Its decoder is cm_match in dgcunp.c; this reproduces the
+ * original's streams of the uniform columns byte for byte. */
+static void cm_match_put(rng_t *e, models_t *m, params_t *P, int cur)
+{
+    int ci = bsr32(m->state);
+    u32 w = m->ctx[ci];
+    u32 v18 = 0x80000, v17 = 0x80000;
+    u32 node = 1;
+    int base = m->prev * 256;
+    int k;
+    for (k = 0; k < 8; k++) {
+        int bit = (cur >> (7 - k)) & 1;
+        u32 pr = (w * m->lit[node] + (u32)m->pair[base + node] * (4096u - w)) >> 12;
+        u32 p, bound;
+        if (e->range <= 0x800000u) rng_renorm(e);
+        bound = (pr * (e->range >> 12)) & 0xFFFFFFFFu;
+        if (bit) {
+            e->low = (e->low + bound) & 0xFFFFFFFFu;
+            e->range = (e->range - bound) & 0xFFFFFFFFu;
+            v18 = (v18 * (4096u - m->lit[node])) >> 12;
+            p = m->pair[base + node];
+            v17 = (v17 * (4096u - p)) >> 12;
+            m->pair[base + node] = (u16)(p - (p >> P->p_pair));
+            m->lit[node] = (u16)(m->lit[node] - (m->lit[node] >> P->p_lit));
+        } else {
+            e->range = bound;
+            v18 = (v18 * m->lit[node]) >> 12;
+            p = m->pair[base + node];
+            v17 = (v17 * p) >> 12;
+            m->pair[base + node] = (u16)(p + ((4096u - p) >> P->p_pair));
+            m->lit[node] = (u16)(m->lit[node] + ((4096u - m->lit[node]) >> P->p_lit));
+        }
+        node = 2 * node + (u32)bit;
+    }
+    m->state = (w * v18 + (4096u - w) * v17) >> 12;
+    if (v18 < v17) m->ctx[ci] = (u16)(w - (w >> P->p_ctx));
+    else if (v18 > v17) m->ctx[ci] = (u16)(w + ((4096u - w) >> P->p_ctx));
+}
+
+static void match_stream(const u8 *data, u32 n, u32 params, int firstbyte_zero,
+                         buf_t *out)
+{
+    models_t m;
+    params_t P;
+    rng_t e;
+    u32 i;
+    P.p_lit   = (params >> 4) & 0xF;
+    P.p_pairb = (params >> 8) & 0xF;
+    P.p_pair  = (params >> 12) & 0xF;
+    P.p_ctx   = (params >> 16) & 0xF;
+    P.p_run   = (params >> 20) & 0xF;
+    models_init(&m, firstbyte_zero);
+    rng_init(&e, out);
+    for (i = 0; i < n; i++) {
+        cm_match_put(&e, &m, &P, data[i]);
+        m.prev = data[i];
+    }
+    rng_flush(&e);
+}
+
 /* ------------------------- the block compressor ------------------------- *
  *  the block stream: the tag 1 block (the compressed data) */
 
@@ -927,10 +989,10 @@ static int column_block(const u8 *data, u32 size, buf_t *out)
         u32 n = 0;
         int order = 0;
         double s0, s1, s2;
-        buf_t A;
+        buf_t A, tmp;
         u8 *ctok;
         u32 cstart = 0;
-        int clz = 0;
+        int clz = 0, match = 0;
         for (i = k; i < size; i += (u32)stride) col[n++] = data[i];
         memcpy(d1, col, n);
         delta_fwd(d1, n, 1);
@@ -944,20 +1006,29 @@ static int column_block(const u8 *data, u32 size, buf_t *out)
         }
         if (order == 1) memcpy(col, d1, n);
         else if (order == 2) memcpy(col, d2, n);
+        /* the best of the four: the literal coder or the match coder,
+         * each with and without the LZ stage */
         memset(&A, 0, sizeof(A));
         cm_stream(col, n, 0x46443320u, 0, &A);
+        memset(&tmp, 0, sizeof(tmp));
+        match_stream(col, n, 0x46443322u, 0, &tmp);
+        if (tmp.len < A.len) { free(A.p); A = tmp; match = 1; }
+        else free(tmp.p);
         ctok = (u8 *)malloc(n ? n : 1);
         if (ctok && lz_stage(col, n, ctok, &cstart)) {
-            buf_t A2;
-            memset(&A2, 0, sizeof(A2));
-            cm_stream(ctok, n, 0x46443320u, 0, &A2);
-            if (A2.len < A.len) { clz = 1; free(A.p); A = A2; }
-            else free(A2.p);
+            memset(&tmp, 0, sizeof(tmp));
+            cm_stream(ctok, n, 0x46443320u, 0, &tmp);
+            if (tmp.len < A.len) { free(A.p); A = tmp; match = 0; clz = 1; }
+            else free(tmp.p);
+            memset(&tmp, 0, sizeof(tmp));
+            match_stream(ctok, n, 0x46443322u, 0, &tmp);
+            if (tmp.len < A.len) { free(A.p); A = tmp; match = 1; clz = 1; }
+            else free(tmp.p);
         }
         bput32(out, 1);
         bput32(out, n);
         bput32(out, ((u32)order << 16) | (clz ? 2 : 0));
-        bput32(out, 0x46443320u);
+        bput32(out, match ? 0x46443322u : 0x46443320u);
         bput32(out, clz ? cstart : 0);   /* v22 */
         bput32(out, n);                  /* v7 */
         bput32(out, A.len);
@@ -1602,6 +1673,16 @@ int main(int argc, char **argv)
             if (!pwlen) return 1;
         }
         return write_spanning(outpath, inpath, partsize, recovery, pw, pwlen);
+    }
+
+    /* the archive encryption is not written by this packer - do not
+     * silently write a plain archive when -p / -k was given */
+    if (pwarg || keyfile) {
+        fprintf(stderr, "dgcpk: -p / -k are only supported by the spanning "
+                        "files (dgcpk s);\n"
+                        "        this packer does not write encrypted "
+                        "archives.\n");
+        return 1;
     }
 
     {
