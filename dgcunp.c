@@ -678,7 +678,7 @@ static int dgc_decompress(const u8 *pay, u32 len, buf_t *out)
             o += 32 + b.lenA + b.lenB;
         } else if (tag == 2) {
             /* the column method: `size` columns, each a compressed block */
-            u32 stride = size, oo = o + 8, k, i, total = 0, n;
+            u32 stride = size, oo = o + 8, k, i, total = 0;
             u8 **cols = NULL;
             u32 *csz = NULL;
             if (stride == 0) return -1;
@@ -715,15 +715,16 @@ static int dgc_decompress(const u8 *pay, u32 len, buf_t *out)
                 total += b.size;
                 oo += 32 + b.lenA + b.lenB;
             }
-            /* de-interleave the columns */
-            n = total / stride;
+            /* de-interleave the columns: the columns of the last row are
+             * shorter when the size is not a multiple of the stride */
             {
                 u8 *buf = (u8 *)malloc(total ? total : 1);
                 if (buf) {
                     memset(buf, 0, total);
-                    for (i = 0; i < n; i++)
-                        for (k = 0; k < stride; k++)
-                            if (i < csz[k]) buf[i * stride + k] = cols[k][i];
+                    for (k = 0; k < stride; k++)
+                        for (i = 0; i < csz[k]; i++)
+                            if ((unsigned __int64)i * stride + k < total)
+                                buf[i * stride + k] = cols[k][i];
                     bput(out, buf, total);
                     free(buf);
                 }

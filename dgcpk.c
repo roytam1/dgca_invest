@@ -24,6 +24,7 @@
 #include <string.h>
 #include <sys\stat.h>
 #include <windows.h>
+#include <math.h>
 
 typedef unsigned char      u8;
 typedef unsigned int       u32;
@@ -490,9 +491,9 @@ static void models_init(models_t *m, int firstbyte_zero)
 static int bsr32(u32 x)
 {
     int n = 0;
-    if (!x) return 31;
+    if (!x) return 31;          /* the code pre-loads 1Fh before the BSR */
     while (!(x & 0x80000000u)) { x <<= 1; n++; }
-    return n;
+    return 31 - n;
 }
 
 /* the prepare pass: the tree of the previous byte, from the deepest node up */
@@ -758,6 +759,148 @@ static void store_block(const u8 *data, u32 size, buf_t *out)
     bput32(out, 0);
     bput32(out, size);
     bput(out, data, size);
+}
+
+/* ------------------- the column method (tag 2, sub_424FE0) -------------------
+ *  The data is split into `stride` interleaved columns; every column is
+ *  delta transformed (the order is chosen per column from the spread of
+ *  its byte histogram) and compressed as its own tag 1 block with the
+ *  pre-transform switched off.  The tag 2 header is
+ *      tag = 2, size = the stride
+ *  and the columns follow as tag 1 blocks.
+ *  (the original also runs the LZ stage on the columns and the "match"
+ *  coder on the very uniform ones; both are optional for the decoder) */
+
+/* the deviation of the byte histogram from the uniform one - the writer's
+ * measure of how well a column compresses (larger = more concentrated) */
+static double col_spread(const u8 *p, u32 n)
+{
+    u32 cnt[256], i;
+    double s = 0.0;
+    if (!n) return 0.0;
+    memset(cnt, 0, sizeof(cnt));
+    for (i = 0; i < n; i++) cnt[p[i]]++;
+    for (i = 0; i < 256; i++) {
+        double v = (double)cnt[i] * 256.0 / (double)n - 1.0;
+        s += v * v;
+    }
+    return sqrt(s * 0.00392156862745098);
+}
+
+/* the stride of the column method (1..16), 0 when the data is not
+ * "column friendly".  sub_423F90: the mean |x[i]-x[i-d]| is computed for
+ * every lag; the columns are used when the best lag is far better than
+ * the average one (best * 4 < the average). */
+static int choose_stride(const u8 *p, u32 n)
+{
+    double m[17], avg = 0.0, best;
+    int d, bi;
+    if (n < 0x400) return 0;
+    for (d = 1; d <= 16; d++) {
+        u64 sum = 0;
+        u32 i, cnt = 0;
+        for (i = (u32)d; i < n; i++) {
+            int v = (int)p[i] - (int)p[i - (u32)d];
+            sum += (u64)(v < 0 ? -v : v);
+            cnt++;
+        }
+        m[d] = cnt ? (double)sum / (double)cnt : 0.0;
+        avg += m[d];
+    }
+    avg /= 16.0;
+    best = m[1]; bi = 1;
+    for (d = 2; d <= 16; d++) if (m[d] < best) { best = m[d]; bi = d; }
+    if (best * 4.0 < avg) return bi;
+    return 0;
+}
+
+/* the forward delta (the inverse of inverse_delta in dgcunp.c) */
+static void delta_fwd(u8 *p, u32 n, int order)
+{
+    int k;
+    u32 i;
+    for (k = 0; k < order; k++) {
+        u8 prev = 0;
+        for (i = 0; i < n; i++) {
+            u8 v = p[i];
+            p[i] = (u8)(v - prev);
+            prev = v;
+        }
+    }
+}
+
+/* build the tag 2 block; returns 0 if the data is not column friendly */
+static int column_block(const u8 *data, u32 size, buf_t *out)
+{
+    int stride = choose_stride(data, size);
+    u32 k, i, maxcol;
+    u8 *col, *d1, *d2;
+    if (!stride) return 0;
+    maxcol = (size + (u32)stride - 1) / (u32)stride;
+    col = (u8 *)malloc(maxcol ? maxcol : 1);
+    d1  = (u8 *)malloc(maxcol ? maxcol : 1);
+    d2  = (u8 *)malloc(maxcol ? maxcol : 1);
+    if (!col || !d1 || !d2) { free(col); free(d1); free(d2); return 0; }
+    bput32(out, 2);
+    bput32(out, (u32)stride);
+    for (k = 0; k < (u32)stride; k++) {
+        u32 n = 0;
+        int order = 0;
+        double s0, s1, s2;
+        buf_t A;
+        for (i = k; i < size; i += (u32)stride) col[n++] = data[i];
+        memcpy(d1, col, n);
+        delta_fwd(d1, n, 1);
+        s0 = col_spread(col, n);
+        s1 = col_spread(d1, n);
+        if (s0 * 1.2 <= s1) {
+            memcpy(d2, d1, n);
+            delta_fwd(d2, n, 1);
+            s2 = col_spread(d2, n);
+            order = (s1 * 1.1 < s2 && s2 * s0 * 1.8 > s1 * s1) ? 2 : 1;
+        }
+        if (order == 1) memcpy(col, d1, n);
+        else if (order == 2) memcpy(col, d2, n);
+        memset(&A, 0, sizeof(A));
+        cm_stream(col, n, 0x46443320u, 0, &A);
+        bput32(out, 1);
+        bput32(out, n);
+        bput32(out, (u32)order << 16);   /* the flags: the delta order */
+        bput32(out, 0x46443320u);
+        bput32(out, 0);                  /* v22 (there is no chain walk) */
+        bput32(out, n);                  /* v7 */
+        bput32(out, A.len);
+        bput32(out, 0);                  /* lenB */
+        bput(out, A.p, A.len);
+        free(A.p);
+    }
+    free(col); free(d1); free(d2);
+    return 1;
+}
+
+/* one data block: stored, the plain compressed block, or the columns */
+static void put_data_block(const u8 *data, u32 size, u32 params, int nocompress,
+                           buf_t *out)
+{
+    buf_t plain, col;
+    if (nocompress) { store_block(data, size, out); return; }
+    memset(&plain, 0, sizeof(plain));
+    compress_block(data, size, params, &plain);
+    if (plain.len >= size + 8) {      /* the writer stores when it does not pay */
+        store_block(data, size, out);
+        free(plain.p);
+        return;
+    }
+    memset(&col, 0, sizeof(col));
+    if (column_block(data, size, &col) && col.len < plain.len) {
+        bput(out, col.p, col.len);
+        free(col.p);
+        free(plain.p);
+        return;
+    }
+    free(col.p);
+    bput(out, plain.p, plain.len);
+    free(plain.p);
 }
 
 /* ----------------------------- the chunks ----------------------------- */
@@ -1222,10 +1365,19 @@ static int write_spanning(const char *base, const char *file, u32 partsize,
 }
 
 /* ------------------------- the directory tree ------------------------- */
-static void add_entry(entry_t *ents, int *nents, int maxents, const char *file,
+static void add_entry(entry_t **pents, int *nents, int *cap, const char *file,
                       const char *path, struct stat *st, int identity, int depth)
 {
-    if (*nents >= maxents) return;
+    entry_t *ents = *pents;
+    if (*nents >= *cap) {
+        int nc = *cap ? *cap * 2 : 256;
+        entry_t *ne = (entry_t *)realloc(ents, (size_t)nc * sizeof(entry_t));
+        if (!ne) { fprintf(stderr, "out of memory\n"); exit(2); }
+        memset(ne + *cap, 0, (size_t)(nc - *cap) * sizeof(entry_t));
+        ents = ne;
+        *pents = ne;
+        *cap = nc;
+    }
     strncpy(ents[*nents].file, file, 1023);
     ents[*nents].file[1023] = 0;
     strncpy(ents[*nents].path, path, 1023);
@@ -1254,7 +1406,7 @@ static void add_entry(entry_t *ents, int *nents, int maxents, const char *file,
                 {
                     char npath[1024];
                     sprintf(npath, "%s\\%s", path, fd.cFileName);
-                    add_entry(ents, nents, maxents, sub, npath, &s2, identity,
+                    add_entry(pents, nents, cap, sub, npath, &s2, identity,
                               depth + 1);
                 }
             } while (FindNextFileA(h, &fd));
@@ -1314,7 +1466,7 @@ static void usage(void)
 
 int main(int argc, char **argv)
 {
-    entry_t *ents;
+    entry_t *ents = NULL;
     int nents = 0, i, j;
     int nocompress = 0, perfile = 0, identity = 0, recovery = 0;
     int spanning = 0;
@@ -1360,22 +1512,24 @@ int main(int argc, char **argv)
         return write_spanning(outpath, inpath, partsize, recovery, pw, pwlen);
     }
 
-    ents = (entry_t *)calloc(argc, sizeof(entry_t));
-    coff = (u32 *)calloc(argc, sizeof(u32));
-    csize = (u32 *)calloc(argc, sizeof(u32));
-    if (!ents || !coff || !csize) { fprintf(stderr, "out of memory\n"); return 2; }
-    for (i = 1; i < argc; i++) {
-        struct stat st;
-        if (!strcmp(argv[i], "a") || argv[i][0] == '-') continue;
-        if (outpath == argv[i]) continue;
-        if (stat(argv[i], &st) != 0) {
-            fprintf(stderr, "cannot stat %s\n", argv[i]);
-            return 1;
+    {
+        int cap = 0;
+        for (i = 1; i < argc; i++) {
+            struct stat st;
+            if (!strcmp(argv[i], "a") || argv[i][0] == '-') continue;
+            if (outpath == argv[i]) continue;
+            if (stat(argv[i], &st) != 0) {
+                fprintf(stderr, "cannot stat %s\n", argv[i]);
+                return 1;
+            }
+            add_entry(&ents, &nents, &cap, argv[i], relpath(argv[i]), &st,
+                      identity, 0);
         }
-        add_entry(ents, &nents, argc, argv[i], relpath(argv[i]), &st,
-                  identity, 0);
     }
     if (!nents) usage();
+    coff = (u32 *)calloc(nents, sizeof(u32));
+    csize = (u32 *)calloc(nents, sizeof(u32));
+    if (!coff || !csize) { fprintf(stderr, "out of memory\n"); return 2; }
 
     /* the data */
     {
@@ -1407,8 +1561,7 @@ int main(int argc, char **argv)
                 buf_t blk, dgcc;
                 memset(&blk, 0, sizeof(blk));
                 memset(&dgcc, 0, sizeof(dgcc));
-                if (nocompress) store_block(alldata + off, ents[i].size, &blk);
-                else compress_block(alldata + off, ents[i].size, params, &blk);
+                put_data_block(alldata + off, ents[i].size, params, nocompress, &blk);
                 off += ents[i].size;
                 put_chunk(&dgcc, "DGCC", 0, blk.p, blk.len);
                 coff[i] = dgcchunk.len;
@@ -1421,8 +1574,7 @@ int main(int argc, char **argv)
             buf_t blk, dgcc;
             memset(&blk, 0, sizeof(blk));
             memset(&dgcc, 0, sizeof(dgcc));
-            if (nocompress) store_block(alldata, alldatasize, &blk);
-            else compress_block(alldata, alldatasize, params, &blk);
+            put_data_block(alldata, alldatasize, params, nocompress, &blk);
             put_chunk(&dgcc, "DGCC", 0, blk.p, blk.len);
             for (i = 0; i < nents; i++) { coff[i] = 0; csize[i] = dgcc.len; }
             bput(&dgcchunk, dgcc.p, dgcc.len);
@@ -1476,8 +1628,7 @@ int main(int argc, char **argv)
         }
         memset(&blk, 0, sizeof(blk));
         memset(&dgcc, 0, sizeof(dgcc));
-        if (nocompress) store_block(idx, nents * 64, &blk);
-        else compress_block(idx, nents * 64, params, &blk);
+        put_data_block(idx, nents * 64, params, nocompress, &blk);
         put_chunk(&dgcc, "DGCC", 0, blk.p, blk.len);
         put_chunk(&infochunk, "IFDT", 0, dgcc.p, dgcc.len);
         free(dgcc.p);
@@ -1498,8 +1649,7 @@ int main(int argc, char **argv)
             bput(&names, ents[i].path, l);
             namelen += 4 + l;
         }
-        if (nocompress) store_block(names.p, names.len, &blk);
-        else compress_block(names.p, names.len, params, &blk);
+        put_data_block(names.p, names.len, params, nocompress, &blk);
         put_chunk(&dgcc, "DGCC", 0, blk.p, blk.len);
         put_chunk(&infochunk, "IFNM", 0, dgcc.p, dgcc.len);
         free(dgcc.p);

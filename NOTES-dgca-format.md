@@ -262,6 +262,27 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
   The decoder: every column is decoded (entropy -> chain walk -> the
   inverse delta) and the columns are de-interleaved again:
       data[i*stride + k] = column_k[i]
+  The columns of the last row are SHORTER when the size is not a multiple
+  of the stride (the original writes e.g. stride 12 for a 131072 byte
+  block: 8 columns of 10923 and 4 of 10922 bytes), so the de-interleave
+  must use the length of every column, not total/stride.
+
+  HOW THE WRITER PICKS IT (sub_423F90 and sub_424FE0):
+  * the stride: the mean |data[i]-data[i-d]| is computed for every lag
+    d = 1..16 and the best lag is the stride; the columns are used when
+        best * 4 < (the average of the 16 lags)
+    (there is a secondary test in the lag > 1 branch; sub_423F90 only
+    tests blocks of 0x400 bytes and more).
+  * the delta order of every column, from the "spread" of its byte
+    histogram (larger = more concentrated):
+        spread(x) = sqrt( sum_v (cnt_v*256/n - 1)^2 / 255 )
+        order 0 if spread(col)*1.2 > spread(delta1);
+        else 1, and 2 when spread(delta2) > 1.1*spread(delta1) and
+                    spread(delta2)*spread(col)*1.8 > spread(delta1)^2.
+  * the LZ stage is switched off for order 2 and when spread(delta1) < 1,
+    and the MATCH coder (the params' bit 1) is switched on when
+    spread(delta1) < 5 - that is why the uniform columns of the 16 bit
+    PCM test use it.
 
   6.6  THE MODEL PARAMETERS  (the params word)
   --------------------------------------------
@@ -278,13 +299,16 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
 
   6.7  WHAT IS STILL NOT KNOWN
   ----------------------------
-  * The MATCH coder (sub_427D60 / sub_427640), used when the params' bit 1
-    is set (the "column" method uses it for very uniform columns).  None
-    of the sample archives uses it.
-  * The exact rule that decides whether the column method is used (the
-    chi-square test in sub_423F90) - not needed for decoding.
-  * The encryption (-p / -k) is specified in section 8 but not implemented
-    in dgcunp.c.
+  * The MATCH coder of the ENCODER (sub_427D60 / sub_427640), used when
+    the params' bit 1 is set.  The DECODER is implemented in dgcunp.c
+    (cm_match) and handles it: the original's column method uses it for
+    the very uniform columns (spread(delta1) < 5, see 6.5), e.g. the
+    even columns of a 16 bit PCM file.  dgcpk.c does not encode it yet.
+  * The LZ stage of the PACKER: the forward permutation sub_428270 (the
+    inverse of the chain walk) is not implemented in dgcpk.c, so its
+    archives are bigger than the tool's on text and solid data.
+  * The encryption (-p / -k) is implemented in dgcunp.c and dgcpk.c
+    (section 8).
 
 
 7. -r RECOVERY DATA
@@ -626,6 +650,17 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
     The flags are 4 (the pre-transform): the packer does NOT use the
     LZ stage (the chain walk), so the decoder skips it - the archives
     are a little bigger than the tool's but they are read back by it.
+  * the column method: when the lag test of 6.5 fires, the block is
+    written as a tag 2 (size = the stride) and every column is a tag 1
+    with flags = the delta order << 16 (no pre-transform, no LZ stage),
+    params 0x46443320, v7 = the column's length and no model stream.
+    The plain tag 1 block is built as well and the smaller of the two is
+    kept (the tool does not compare - it trusts the lag test).
+  * the store fallback: when the compressed block is not smaller than
+    the data + 8 bytes, the block is stored (tag 0), as the tool does.
+  * the CM coder's context slot is BSR(state) with BSR(0) = 31.  The
+    encoder must use the same: an inverted BSR still produces a stream
+    of the right length, but no decoder can read it.
   * the index: the 64 byte entries (the CRC-32, the attributes, the two
     FILETIMEs, the original size, the compressed size and the offset in
     the DATA payload) stored TRANSPOSED, compressed like any other data.

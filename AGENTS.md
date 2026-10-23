@@ -200,8 +200,9 @@ The traps that cost the most time (do not repeat them):
 * the IFDT blob of a compressed archive differs from the blob of the stored twin (the
   "compressed size" field) - comparing the two is a false oracle.
 
-Still open: the match coder (`sub_427D60` / `sub_427640`, the params' bit 1 - not used by
-any of the sample archives) and the encryption.
+Still open: the match coder of the ENCODER (`sub_427D60` / `sub_427640`, the params' bit 1 -
+the decoder implements it, and the original's column method uses it for very uniform columns)
+and the LZ stage of the packer (the chain walk's forward permutation, `sub_428270`).
 
 
 ## 5. Build & test the unpacker
@@ -246,11 +247,12 @@ Current state of `dgcunp.c`:
 | long UTF-8 names (> MAX_PATH) | working - the wide APIs with the `\\?\` prefix |
 | the crypto of DGCA v1.10 (SHA-512, MT19937, PRNG, cipher, key derivation) | working - byte exact, verified against the original binary |
 | the recovery data (`-R`): the parity table, the repair, the archive's CRC-32 | working - a damaged `.dgcr` is repaired and extracted without errors |
-| the packer (`dgcpk.c`) | working - `dgcac.exe` reads back the archives it writes and the extracted files are byte identical |
+| the packer (`dgcpk.c`) | working - `dgcac.exe` reads back the archives it writes and the extracted files are byte identical; it writes the column method (tag 2) too |
 | encrypted archives (`-p` / `-k`) | working - the two keys are cracked (see `NOTES-dgca-format.md` 8.7); the extracted files are byte identical to `dgcac.exe`'s |
 | the spanning files (`.dgd` / `.dgdr`) | working - the parts are found in the directory, put together, checked against the SHA-512 of the INFO chunk and written out; `-R` applies the recovery data of a `.dgdr` |
 | the packer writes the spanning files too | working - `dgcpk s` writes byte identical `.dgd` / `.dgdr` files (the plain, the encrypted and the recovery variant) |
-| the match coder (the params' bit 1) | not implemented (unused by the sample archives) |
+| the match coder (the params' bit 1) | decoded (`cm_match`); not encoded by `dgcpk` |
+| the column method (tag 2) | decoded and encoded; the packer writes it when the lag test of `sub_423F90` fires, the columns without the LZ stage and without the match coder |
 
 The regression test: extract every archive in the work area and check that
 every file's CRC-32 matches the index:
