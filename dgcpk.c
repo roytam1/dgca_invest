@@ -715,10 +715,72 @@ static void cm_stream(const u8 *data, u32 n, u32 params, int firstbyte_zero,
 
 /* ------------------------- the block compressor ------------------------- *
  *  the block stream: the tag 1 block (the compressed data) */
+
+/* the LZ stage (sub_428270): the token buffer is the fixed point of the
+ * rank iteration below.  Every byte gets the rank of its value (the stable
+ * order by value); the ranks are then re-sorted by the rank of the NEXT
+ * byte until nothing changes.  The decoder's chain walk (dgcunp.c,
+ * lz_inverse) inverts it; `start` is the rank of the first byte.
+ * It reproduces the original's token buffer byte for byte (the text.txt
+ * block of all.dgc: start 50856, stream A 19649). */
+#define LZ_MAX (8u * 1024u * 1024u)   /* the rank arrays are 16 bytes a byte */
+
+static int lz_stage(const u8 *data, u32 n, u8 *tok, u32 *start)
+{
+    u32 *rank, *newr, *a, *inva;
+    u32 base[256], cnt[256], w[256];
+    u32 i, k, v, it;
+    int ok = 0;
+
+    if (!n) { *start = 0; return 1; }
+    if (n > LZ_MAX) return 0;
+    rank = (u32 *)malloc(sizeof(u32) * n);
+    newr = (u32 *)malloc(sizeof(u32) * n);
+    a    = (u32 *)malloc(sizeof(u32) * n);
+    inva = (u32 *)malloc(sizeof(u32) * n);
+    if (!rank || !newr || !a || !inva) {
+        free(rank); free(newr); free(a); free(inva);
+        return 0;
+    }
+    memset(cnt, 0, sizeof(cnt));
+    for (i = 0; i < n; i++) cnt[data[i]]++;
+    base[0] = 0;
+    for (v = 1; v < 256; v++) base[v] = base[v - 1] + cnt[v - 1];
+    /* the stable rank by value */
+    memset(w, 0, sizeof(w));
+    for (i = 0; i < n; i++) {
+        v = data[i];
+        rank[i] = base[v] + w[v]++;
+    }
+    for (it = 0; it < 128; it++) {
+        for (k = 0; k < n; k++) a[k] = rank[(k + 1) % n];
+        for (k = 0; k < n; k++) inva[a[k]] = k;
+        /* the members of every value group, in the order of their rank
+         * (i.e. by a[]), get the ranks base[v]..base[v]+cnt[v]-1 */
+        memcpy(w, base, sizeof(w));
+        for (k = 0; k < n; k++) {
+            i = inva[k];
+            v = data[i];
+            newr[i] = w[v]++;
+        }
+        if (!memcmp(newr, rank, sizeof(u32) * n)) { ok = 1; break; }
+        memcpy(rank, newr, sizeof(u32) * n);
+    }
+    if (ok) {
+        for (k = 0; k < n; k++) tok[a[k]] = data[k];
+        *start = rank[0];
+    }
+    free(rank); free(newr); free(a); free(inva);
+    return ok;
+}
+
 static void compress_block(const u8 *data, u32 size, u32 params,
                            buf_t *out)
 {
     buf_t lits, model, A, B;
+    u8 *tok = NULL;
+    u32 start = 0;
+    int lz = 0;
     int minlen_exp = (params >> 24) & 0xF;
     int model_shift = (params >> 28) & 0xF;
     int firstbyte_zero = (params & 1) != 0;
@@ -734,19 +796,37 @@ static void compress_block(const u8 *data, u32 size, u32 params,
         pre_transform(&me, data, size, minlen_exp, model_shift, &lits, &model);
         rng_flush(&me);
     }
-    /* the token buffer (the literals) with the CM coder */
+    /* the LZ stage: a permutation of the literals (flags bit 1).  The
+     * fixed point iteration does not settle on every input, so the plain
+     * stream is coded as well and the smaller of the two is kept. */
     cm_stream(lits.p, lits.len, params, firstbyte_zero, &A);
+    if (lits.len) {
+        buf_t A2;
+        memset(&A2, 0, sizeof(A2));
+        tok = (u8 *)malloc(lits.len);
+        if (tok && lz_stage(lits.p, lits.len, tok, &start)) {
+            cm_stream(tok, lits.len, params, firstbyte_zero, &A2);
+            if (A2.len < A.len) {
+                lz = 1;
+                free(A.p);
+                A = A2;
+            } else {
+                free(A2.p);
+            }
+        }
+    }
     /* the block header */
     bput32(out, 1);           /* the tag */
     bput32(out, size);        /* the original size */
-    bput32(out, 0x04);        /* the flags: the pre-transform */
+    bput32(out, lz ? 0x06 : 0x04);  /* the flags: pre-transform (+ LZ) */
     bput32(out, params);
-    bput32(out, 0);          /* v22: the chain walk's start (not used) */
+    bput32(out, lz ? start : 0);    /* v22: the chain walk's start */
     bput32(out, lits.len);    /* v7: the token buffer's size */
     bput32(out, A.len);
     bput32(out, model.len);
     bput(out, A.p, A.len);
     bput(out, model.p, model.len);
+    free(tok);
     free(lits.p);
     free(model.p);
     free(A.p);
@@ -848,6 +928,9 @@ static int column_block(const u8 *data, u32 size, buf_t *out)
         int order = 0;
         double s0, s1, s2;
         buf_t A;
+        u8 *ctok;
+        u32 cstart = 0;
+        int clz = 0;
         for (i = k; i < size; i += (u32)stride) col[n++] = data[i];
         memcpy(d1, col, n);
         delta_fwd(d1, n, 1);
@@ -863,15 +946,24 @@ static int column_block(const u8 *data, u32 size, buf_t *out)
         else if (order == 2) memcpy(col, d2, n);
         memset(&A, 0, sizeof(A));
         cm_stream(col, n, 0x46443320u, 0, &A);
+        ctok = (u8 *)malloc(n ? n : 1);
+        if (ctok && lz_stage(col, n, ctok, &cstart)) {
+            buf_t A2;
+            memset(&A2, 0, sizeof(A2));
+            cm_stream(ctok, n, 0x46443320u, 0, &A2);
+            if (A2.len < A.len) { clz = 1; free(A.p); A = A2; }
+            else free(A2.p);
+        }
         bput32(out, 1);
         bput32(out, n);
-        bput32(out, (u32)order << 16);   /* the flags: the delta order */
+        bput32(out, ((u32)order << 16) | (clz ? 2 : 0));
         bput32(out, 0x46443320u);
-        bput32(out, 0);                  /* v22 (there is no chain walk) */
+        bput32(out, clz ? cstart : 0);   /* v22 */
         bput32(out, n);                  /* v7 */
         bput32(out, A.len);
         bput32(out, 0);                  /* lenB */
         bput(out, A.p, A.len);
+        free(ctok);
         free(A.p);
     }
     free(col); free(d1); free(d2);

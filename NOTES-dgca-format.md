@@ -167,27 +167,26 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
   The walk is a pure permutation of the token buffer, so the token buffer
   has the same byte histogram as the pre-transform's literals.
 
-  THE ENCODER'S LZ STAGE (sub_428270) - what is known so far
-  ----------------------------------------------------------
-  The input (the pre-transform's literals) is first SORTED by its following
-  context with a stable radix sort over 2 byte keys:
-      key at offset v80-2 first, then the offsets v80-4, v80-6, ... 0
-  (v80 = 8, or 4 when the histogram spread is < 1), so the final order is
-  lexicographic on the 8 (or 4) bytes at i..i+7 (circular: the source is
-  copied with its first 64 bytes appended).  A second pass turns the sorted
-  order into runs of equal 4/8 byte contexts (a signed run length array).
-  The token buffer is then
-      token[j] = src[(chain[j] + v80 - 3) mod n]
-  and the start (v22) is the j where chain[j] == 0.
-  What is NOT decoded yet: the cycle merge that follows the sort.  The
-  sorted order alone leaves several cycles in the chain-walk permutation
-  (e.g. 6 on 5 KB of text), so the walk cannot invert it; the encoder
-  merges the runs (sub_428270's second half, with a doubling shift v88 and
-  a call through the object's vtable slot 1) until one cycle is left.
-  The oracle for the port: the text.txt block of all.dgc has v7 = size
-  (no matches), so the LZ stage's input is the file itself; decode its
-  stream A with cm.py to get the real token buffer and compare with the
-  port's output (start = 50856 for that block).
+  THE ENCODER'S LZ STAGE (sub_428270)
+  -----------------------------------
+  The token buffer is the fixed point of this iteration:
+      rank[i] = the stable rank of data[i] by value
+      repeat
+          a[k] = rank[(k+1) mod n]
+          for every value group, order its members by a[] and give them
+          the ranks base[value] .. base[value]+cnt[value]-1
+      until nothing changes
+      token[a[k]] = data[k];   start = rank[0]
+  The chain walk of 6.2 inverts it.  The binary implements the same thing
+  with a radix sort by the 8 (or 4) byte FOLLOWING context (2 byte keys at
+  the offsets 6, 4, 2, 0, the source copied with its first 64 bytes
+  appended) and a cycle merge; the iteration above is the definition that
+  merge computes.  It reproduces the original's token buffer byte for byte:
+  the text.txt block of all.dgc has start 50856 and stream A 19649.
+  The iteration does not settle on every input (the delta transformed
+  columns of the 16 bit matrix, for example): a packer must then keep the
+  plain stream.  The flags' bit 0 (this[4]) is set by the binary on every
+  block of the samples but is not used by the decoder.
 
   6.3  THE PRE-TRANSFORM  (sub_424C30 / sub_424910)
   ---------------------------------------------------
@@ -669,15 +668,16 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
   * the block: the tag 1, the original size, the flags, the params
     (0x46453320 - the same as the tool's), v22, v7 (the token buffer's
     size), lenA, lenB and the two streams.
-    The flags are 4 (the pre-transform): the packer does NOT use the
-    LZ stage (the chain walk), so the decoder skips it - the archives
-    are a little bigger than the tool's but they are read back by it.
+    The flags are 6 (the pre-transform and the LZ stage): the literals are
+    permuted by the LZ stage of 6.2 and v22 is its start.  When the LZ
+    iteration does not settle, the plain stream (flags 4) is written
+    instead - both are coded and the smaller one is kept.
   * the column method: when the lag test of 6.5 fires, the block is
     written as a tag 2 (size = the stride) and every column is a tag 1
-    with flags = the delta order << 16 (no pre-transform, no LZ stage),
-    params 0x46443320, v7 = the column's length and no model stream.
-    The plain tag 1 block is built as well and the smaller of the two is
-    kept (the tool does not compare - it trusts the lag test).
+    with flags = the delta order << 16 (+ 2 when the column's LZ stage
+    settles), params 0x46443320, v7 = the column's length and no model
+    stream.  The plain tag 1 block is built as well and the smaller of the
+    two is kept (the tool does not compare - it trusts the lag test).
   * the store fallback: when the compressed block is not smaller than
     the data + 8 bytes, the block is stored (tag 0), as the tool does.
   * the CM coder's context slot is BSR(state) with BSR(0) = 31.  The
