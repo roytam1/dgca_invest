@@ -167,6 +167,28 @@ Sources: dgcac.exe.c (Hex-Rays), dgcac.exe.lst (IDA), plus ~100 archives produce
   The walk is a pure permutation of the token buffer, so the token buffer
   has the same byte histogram as the pre-transform's literals.
 
+  THE ENCODER'S LZ STAGE (sub_428270) - what is known so far
+  ----------------------------------------------------------
+  The input (the pre-transform's literals) is first SORTED by its following
+  context with a stable radix sort over 2 byte keys:
+      key at offset v80-2 first, then the offsets v80-4, v80-6, ... 0
+  (v80 = 8, or 4 when the histogram spread is < 1), so the final order is
+  lexicographic on the 8 (or 4) bytes at i..i+7 (circular: the source is
+  copied with its first 64 bytes appended).  A second pass turns the sorted
+  order into runs of equal 4/8 byte contexts (a signed run length array).
+  The token buffer is then
+      token[j] = src[(chain[j] + v80 - 3) mod n]
+  and the start (v22) is the j where chain[j] == 0.
+  What is NOT decoded yet: the cycle merge that follows the sort.  The
+  sorted order alone leaves several cycles in the chain-walk permutation
+  (e.g. 6 on 5 KB of text), so the walk cannot invert it; the encoder
+  merges the runs (sub_428270's second half, with a doubling shift v88 and
+  a call through the object's vtable slot 1) until one cycle is left.
+  The oracle for the port: the text.txt block of all.dgc has v7 = size
+  (no matches), so the LZ stage's input is the file itself; decode its
+  stream A with cm.py to get the real token buffer and compare with the
+  port's output (start = 50856 for that block).
+
   6.3  THE PRE-TRANSFORM  (sub_424C30 / sub_424910)
   ---------------------------------------------------
   An LZ77 with an IMPLICIT distance: a 2 byte hash table maps
