@@ -268,6 +268,14 @@ foreach ($a in Get-ChildItem *.dgc, *.dgcr) {
 Nothing may be printed (the `names.dgc` archive has 5981 entries with Japanese
 file names, so the extraction takes a moment).
 
+Corrupt input is handled: a chunk's payload size is clamped to the image and
+the walk must advance (a `0xFFFFFFE0` size used to wrap and hang, a
+`0x7FFFFFF0` size ran the CRC off the image), the block's lengths, token size
+and column stride are checked without wrapping, the parity table's size is
+64-bit with plausible `rows`/`cols`/`pages`, and a `.dgd` claiming more parts
+than `MAXPART` is rejected.  These cases are crafted in the scratch dir
+(`colwork/fuzz`) and must exit 0/1.
+
 ---
 
 ## 6. Method that worked - use the tool as an oracle

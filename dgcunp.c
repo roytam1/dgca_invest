@@ -111,6 +111,26 @@ static int chunk_is_container(const char *id)
 
 static u32 align16(u32 x) { return (x + 15u) & ~15u; }
 
+/* the payload size of the chunk at p, clamped to what is left before end
+ * (a corrupt size must not make the walk or the CRC run off the image) */
+static u32 chunk_psize(u32 p, u32 end)
+{
+    u32 ps = rd32(g_img + p + 8);
+    if (ps > end - p - 32) ps = end - p - 32;
+    return ps;
+}
+
+/* the offset of the next chunk, 0 when the walk has to stop (a corrupt
+ * size must not wrap around or go backwards) */
+static u32 next_chunk(u32 p, u32 ps, u32 end)
+{
+    u32 n = p + 32 + ps;
+    if (n <= p || n > end) return 0;
+    n = align16(n);
+    if (n <= p) return 0;
+    return n;
+}
+
 static int chunk_id_known(const char *id)
 {
     return !strcmp(id, "DGCA") || !strcmp(id, "DATA") || !strcmp(id, "INFO") ||
@@ -121,9 +141,10 @@ static int chunk_id_known(const char *id)
 static void walk(u32 off, u32 end, u32 depth, const char *parent)
 {
     u32 p = off;
+    if (end > g_imgsize) end = g_imgsize;
     while (p + 32 <= end) {
         const u8 *h = g_img + p;
-        u32 ps = rd32(h + 8);
+        u32 ps = chunk_psize(p, end);
         chunk_t *c;
         char id[5];
         if (g_nchunk >= MAXCHUNK) return;
@@ -140,7 +161,8 @@ static void walk(u32 off, u32 end, u32 depth, const char *parent)
         memcpy(c->id, h, 4); c->id[4] = 0;
         if (strcmp(c->id, "DGCR") && chunk_is_container(c->id))
             walk(p + 32, p + 32 + ps, depth + 1, c->id);
-        p = align16(p + 32 + ps);
+        p = next_chunk(p, ps, end);
+        if (!p) return;
     }
 }
 
@@ -157,15 +179,17 @@ static chunk_t *child_chunk(chunk_t *parent, const char *id)
 {
     static chunk_t res;
     u32 p = parent->off + 32, end = parent->off + 32 + parent->psize;
+    if (end > g_imgsize) end = g_imgsize;
     while (p + 32 <= end) {
         const u8 *h = g_img + p;
-        u32 ps = rd32(h + 8);
+        u32 ps = chunk_psize(p, end);
         if (!memcmp(h, id, 4)) {
             res.off = p; res.psize = ps; res.depth = parent->depth + 1;
             memcpy(res.id, h, 4); res.id[4] = 0;
             return &res;
         }
-        p = align16(p + 32 + ps);
+        p = next_chunk(p, ps, end);
+        if (!p) return NULL;
     }
     return NULL;
 }
@@ -204,7 +228,7 @@ static int dgc_blocks(const u8 *pay, u32 len, dblock_t *out, int max)
         b->flags = b->params = b->v22 = b->v7 = b->lenA = b->lenB = 0;
         b->A = b->B = NULL;
         if (b->tag == 0) {
-            if (o + 8 + b->size > len) return -1;
+            if (b->size > len - o - 8) return -1;
             b->A = pay + o + 8;
             o += 8 + b->size;
         } else if (b->tag == 1) {
@@ -215,20 +239,23 @@ static int dgc_blocks(const u8 *pay, u32 len, dblock_t *out, int max)
             b->v7     = rd32(pay + o + 20);
             b->lenA   = rd32(pay + o + 24);
             b->lenB   = rd32(pay + o + 28);
-            if (o + 32 + b->lenA + b->lenB > len) return -1;
+            if (b->lenA > len - o - 32) return -1;
+            if (b->lenB > len - o - 32 - b->lenA) return -1;
+            if (b->v7 > b->size) return -1;
             b->A = pay + o + 32;
             b->B = b->A + b->lenA;
             o += 32 + b->lenA + b->lenB;
         } else if (b->tag == 2) {
             /* CHAIN: `size` compressed blocks follow; expand them in place */
             u32 cnt = b->size, k, oo = o + 8;
+            if (cnt > (len - o - 8) / 8) return -1;
             for (k = 0; k < cnt && n < max; k++) {
                 dblock_t *ib = &out[n];
                 if (oo + 32 > len) break;
                 ib->tag = rd32(pay + oo);
                 ib->size = rd32(pay + oo + 4);
                 if (ib->tag == 0) {
-                    if (oo + 8 + ib->size > len) break;
+                    if (ib->size > len - oo - 8) break;
                     ib->A = pay + oo + 8;
                     ib->B = NULL;
                     ib->flags = ib->params = ib->v22 = ib->v7 = ib->lenA = ib->lenB = 0;
@@ -240,7 +267,8 @@ static int dgc_blocks(const u8 *pay, u32 len, dblock_t *out, int max)
                     ib->v7     = rd32(pay + oo + 20);
                     ib->lenA   = rd32(pay + oo + 24);
                     ib->lenB   = rd32(pay + oo + 28);
-                    if (oo + 32 + ib->lenA + ib->lenB > len) break;
+                    if (ib->lenA > len - oo - 32) break;
+                    if (ib->lenB > len - oo - 32 - ib->lenA) break;
                     ib->A = pay + oo + 32;
                     ib->B = ib->A + ib->lenA;
                     oo += 32 + ib->lenA + ib->lenB;
@@ -647,7 +675,7 @@ static int dgc_decompress(const u8 *pay, u32 len, buf_t *out)
     while (o + 8 <= len) {
         u32 tag = rd32(pay + o), size = rd32(pay + o + 4);
         if (tag == 0) {
-            if (o + 8 + size > len) return -1;
+            if (size > len - o - 8) return -1;
             bput(out, pay + o + 8, size);
             o += 8 + size;
         } else if (tag == 1) {
@@ -662,7 +690,9 @@ static int dgc_decompress(const u8 *pay, u32 len, buf_t *out)
             b.v7     = rd32(pay + o + 20);
             b.lenA   = rd32(pay + o + 24);
             b.lenB   = rd32(pay + o + 28);
-            if (o + 32 + b.lenA + b.lenB > len) return -1;
+            if (b.lenA > len - o - 32) return -1;
+            if (b.lenB > len - o - 32 - b.lenA) return -1;
+            if (b.v7 > size) return -1;
             b.A = pay + o + 32;
             b.B = b.A + b.lenA;
             tmp = (u8 *)malloc(size ? size : 1);
@@ -682,6 +712,7 @@ static int dgc_decompress(const u8 *pay, u32 len, buf_t *out)
             u8 **cols = NULL;
             u32 *csz = NULL;
             if (stride == 0) return -1;
+            if (stride > (len - o - 8) / 8) return -1;
             cols = (u8 **)malloc(sizeof(u8 *) * stride);
             csz = (u32 *)malloc(sizeof(u32) * stride);
             if (!cols || !csz) { free(cols); free(csz); return -1; }
@@ -700,7 +731,9 @@ static int dgc_decompress(const u8 *pay, u32 len, buf_t *out)
                 b.v7     = rd32(pay + oo + 20);
                 b.lenA   = rd32(pay + oo + 24);
                 b.lenB   = rd32(pay + oo + 28);
-                if (oo + 32 + b.lenA + b.lenB > len) break;
+                if (b.lenA > len - oo - 32) break;
+                if (b.lenB > len - oo - 32 - b.lenA) break;
+                if (b.v7 > b.size) break;
                 b.A = pay + oo + 32;
                 b.B = b.A + b.lenA;
                 tmp = (u8 *)malloc(b.size ? b.size : 1);
@@ -1213,10 +1246,11 @@ static void decrypt_dgcc_records(u32 off, u32 end)
             return;
         }
         ps = rd32(hdr + 8);
-        if (p + 32 + ps > end) return;
+        if (ps > end - p - 32) return;
         crypt_setkey_pw2(&c2, hdr, 32, g_pw, g_pwlen);
         crypt_decrypt(&c2, g_img + p + 32, ps);
-        p = align16(p + 32 + ps);
+        p = next_chunk(p, ps, end);
+        if (!p) return;
     }
 }
 
@@ -1346,7 +1380,13 @@ static int dgcr_repair(chunk_t *dgcr, u32 off, u32 crc, const char *path,
     pages = rd32(ip + 0x18);
     alen = off;
     if (off > g_imgsize) { printf("the archive offset is outside the file\n"); return 0; }
-    if (data.psize < len || len < (rows * cols + pages * rows + rows) * 4) {
+    if (rows == 0 || cols == 0 || pages == 0 ||
+        rows > 0x100000u || cols > 0x100000u || pages > 0x100000u) {
+        printf("the recovery parameters are not plausible\n");
+        return 0;
+    }
+    if ((u64)data.psize < (u64)len ||
+        (u64)len < ((u64)rows * cols + (u64)pages * rows + rows) * 4) {
         printf("the recovery data is too short\n");
         return 0;
     }
@@ -1360,8 +1400,8 @@ static int dgcr_repair(chunk_t *dgcr, u32 off, u32 crc, const char *path,
     /* the word of the archive: (page, row, column).  The matrix is padded
      * with zeros if the archive is shorter than rows*cols*pages words. */
 #define ARCHWORD(pg, rw, cl) \
-    ((((pg) * rows + (rw)) * cols + (cl)) * 4 + 4 > alen ? 0u : \
-     rd32(g_img + (((pg) * rows + (rw)) * cols + (cl)) * 4))
+    ((((u64)(pg) * rows + (rw)) * cols + (cl)) * 4 + 4 > (u64)alen ? 0u : \
+     rd32(g_img + (u32)((((u64)(pg) * rows + (rw)) * cols + (cl)) * 4)))
 
     /* 1. the columns whose parity does not match */
     for (i = 0; i < rows; i++) {
@@ -1517,15 +1557,25 @@ static dgpart_t g_part[MAXPART];
 static int      g_npart;
 
 /* find a child chunk of a container (the container's header is at base) */
-static int dgcd_child(const u8 *img, u32 base, u32 psize, const char *id,
-                      u32 *coff, u32 *cps)
+static int dgcd_child(const u8 *img, u32 imgsize, u32 base, u32 psize,
+                      const char *id, u32 *coff, u32 *cps)
 {
-    u32 p = base + 32, end = base + 32 + psize;
+    u32 p, end;
+    if (imgsize < 32 || base > imgsize - 32) return 0;
+    if (psize > imgsize - base - 32) psize = imgsize - base - 32;
+    p = base + 32;
+    end = base + 32 + psize;
     while (p + 32 <= end) {
         const u8 *h = img + p;
         u32 ps = rd32(h + 8);
+        u32 n;
+        if (ps > end - p - 32) ps = end - p - 32;
         if (!memcmp(h, id, 4)) { *coff = p; *cps = ps; return 1; }
-        p = align16(p + 32 + ps);
+        n = p + 32 + ps;
+        if (n <= p) break;
+        n = align16(n);
+        if (n <= p) break;
+        p = n;
     }
     return 0;
 }
@@ -1539,8 +1589,9 @@ static int dgcd_info(const u8 *img, u32 size, dgpart_t *p)
     u8 mat[96], *nm;
     crypt_t c;
     if (size < 32 || memcmp(img, "DGCD", 4)) return 0;
-    if (!dgcd_child(img, 0, rd32(img + 8), "INFO", &ioff, &ips)) return 0;
+    if (!dgcd_child(img, size, 0, rd32(img + 8), "INFO", &ioff, &ips)) return 0;
     if (ips < 96) return 0;
+    if (ioff + 32 + 96 > size) return 0;
     memcpy(mat, img + ioff + 32, 96);
     flags = rd32(mat);
     p->encrypted = (flags & 1) ? 1 : 0;
@@ -1727,8 +1778,10 @@ static int dgcd_main(const char *path, const char *outdir, int verbose,
             if (!pimg) { printf("cannot open %s\n", cp->path); free(buf); free(img); return 1; }
             if (repair) {
                 /* a .dgdr carries the recovery data of its own bytes */
-                u32 goff = align16(32 + rd32(pimg + 8));
-                if (goff + 32 <= psize && !memcmp(pimg + goff, "DGCR", 4)) {
+                u32 rootps = rd32(pimg + 8);
+                u32 goff = 0;
+                if (psize >= 32 && rootps <= psize - 32) goff = align16(32 + rootps);
+                if (goff && goff + 32 <= psize && !memcmp(pimg + goff, "DGCR", 4)) {
                     u8 *simg = g_img;
                     u32 ssize = g_imgsize;
                     chunk_t dg;
@@ -1752,7 +1805,7 @@ static int dgcd_main(const char *path, const char *outdir, int verbose,
                     g_img = simg; g_imgsize = ssize;
                 }
             }
-            if (!dgcd_child(pimg, 0, rd32(pimg + 8), "DATA", &doff, &dps)) {
+            if (!dgcd_child(pimg, psize, 0, rd32(pimg + 8), "DATA", &doff, &dps)) {
                 printf("%s has no DATA chunk\n", cp->path);
                 free(pimg); free(buf); free(img);
                 return 1;
@@ -2082,10 +2135,11 @@ int main(int argc, char **argv)
     if (listonly || !outdir) {
         if (data) {
             u32 p = data->off + 32, end = data->off + 32 + data->psize;
+            if (end > g_imgsize) end = g_imgsize;
             printf("\nDATA chunk: %u bytes\n", data->psize);
             while (p + 32 <= end) {
                 const u8 *h = g_img + p;
-                u32 ps = rd32(h + 8);
+                u32 ps = chunk_psize(p, end);
                 dblock_t blk[64];
                 int nb = dgc_blocks(g_img + p + 32, ps, blk, 64);
                 int k;
@@ -2104,7 +2158,8 @@ int main(int argc, char **argv)
                                blk[k].lenA, blk[k].lenB);
                     printf("\n");
                 }
-                p = align16(p + 32 + ps);
+                p = next_chunk(p, ps, end);
+                if (!p) break;
             }
         }
         return 0;
@@ -2117,15 +2172,17 @@ int main(int argc, char **argv)
         u32 p = data->off + 32, end = data->off + 32 + data->psize;
         u32 done = 0;
         int e;
+        if (end > g_imgsize) end = g_imgsize;
         memset(&raw, 0, sizeof(raw));
         while (p + 32 <= end) {
             const u8 *h = g_img + p;
-            u32 ps = rd32(h + 8);
+            u32 ps = chunk_psize(p, end);
             if (dgc_decompress(g_img + p + 32, ps, &raw) != 0) {
                 printf("  ! the data area could not be decoded completely\n");
                 break;
             }
-            p = align16(p + 32 + ps);
+            p = next_chunk(p, ps, end);
+            if (!p) break;
         }
         printf("\nextracting %d entries to %s (data area %u bytes, crc %08x)\n",
                g_nentry, outdir, (unsigned)raw.len,
