@@ -385,6 +385,19 @@ static void crypt_setkey_fixed(crypt_t *c)
     crypt_setkey(c, zero, 8, (const u8 *)"SecureCryptograph", 17);
 }
 
+/* the encryption of the ARCHIVE ITSELF (-p / -k) */
+static void crypt_setkey_pw1(crypt_t *c, const u8 *pw, u32 pwlen)
+{
+    static const u8 zero[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    crypt_setkey(c, zero, 8, pw, pwlen);
+}
+
+static void crypt_setkey_pw2(crypt_t *c, const u8 *hdr, u32 hlen,
+                             const u8 *pw, u32 pwlen)
+{
+    crypt_setkey(c, hdr, hlen, pw, pwlen);
+}
+
 /* the self test: the key stream of the fixed key */
 static int crypto_selftest(void)
 {
@@ -1105,6 +1118,28 @@ static const char *relpath(const char *path)
     return path;
 }
 
+/* encrypt DGCC records in place: header with key1, payload with key2 */
+static void encrypt_dgcc_records(u8 *buf, u32 len, const u8 *pw, u32 pwlen)
+{
+    u32 p = 0;
+    while (p + 32 <= len) {
+        crypt_t c1, c2;
+        u8 hdr[32];
+        u32 ps;
+        memcpy(hdr, buf + p, 32);
+        if (memcmp(hdr, "DGCC", 4)) break;
+        ps = rd32le(hdr + 8);
+        if (ps > len - p - 32) break;
+        crypt_setkey_pw1(&c1, pw, pwlen);
+        crypt_encrypt(&c1, buf + p, 32);
+        crypt_setkey_pw2(&c2, buf + p, 32, pw, pwlen);
+        crypt_encrypt(&c2, buf + p + 32, ps);
+        p += 32 + ps;
+        p = (p + 15) & ~15u;
+        if (p < 32) break;
+    }
+}
+
 /* the file time (a FILETIME) */
 static u64 file_time(const char *path, int which)
 {
@@ -1581,6 +1616,74 @@ static void add_entry(entry_t **pents, int *nents, int *cap, const char *file,
     }
 }
 
+static int is_dir_ent(entry_t *e)
+{
+    return (e->attr & 0x10) != 0;
+}
+
+static const char *fname_part(const char *path)
+{
+    const char *p = strrchr(path, '\\');
+    if (p) return p + 1;
+    p = strrchr(path, '/');
+    if (p) return p + 1;
+    return path;
+}
+
+static void get_ext(const char *name, char *ext, int max)
+{
+    const char *p = fname_part(name);
+    const char *dot = strrchr(p, '.');
+    ext[0] = 0;
+    if (!dot || dot == p) return;
+    strncpy(ext, dot + 1, max - 1);
+    ext[max - 1] = 0;
+}
+
+static int stricmp_local(const char *a, const char *b)
+{
+    while (*a && *b) {
+        unsigned char ca = (unsigned char)*a;
+        unsigned char cb = (unsigned char)*b;
+        if (ca >= 'A' && ca <= 'Z') ca = ca - 'A' + 'a';
+        if (cb >= 'A' && cb <= 'Z') cb = cb - 'A' + 'a';
+        if (ca != cb) return (int)ca - (int)cb;
+        a++; b++;
+    }
+    return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+
+static int entry_cmp(const void *va, const void *vb)
+{
+    const entry_t *a = (const entry_t *)va;
+    const entry_t *b = (const entry_t *)vb;
+    int da = is_dir_ent(a);
+    int db = is_dir_ent(b);
+    if (da != db) return db - da; /* directories first */
+    if (da && db) {
+        return stricmp_local(a->path, b->path);
+    }
+    /* files: by extension (case-insensitive, no extension first) */
+    {
+        char ea[256], eb[256];
+        int cmp;
+        get_ext(a->path, ea, 256);
+        get_ext(b->path, eb, 256);
+        cmp = stricmp_local(ea, eb);
+        if (cmp) return cmp;
+        /* then by filename */
+        cmp = stricmp_local(fname_part(a->path), fname_part(b->path));
+        if (cmp) return cmp;
+        /* tie-breaker by full path */
+        return stricmp_local(a->path, b->path);
+    }
+}
+
+static void sort_entries(entry_t *ents, int nents)
+{
+    qsort(ents, (size_t)nents, sizeof(entry_t), entry_cmp);
+}
+
 /* the test mode: the CM coder of a file (-T) */
 static int test_mode(const char *path)
 {
@@ -1613,15 +1716,15 @@ static int test_mode(const char *path)
 static void usage(void)
 {
     printf("dgcpk - the DGC archiver (the format of DGCA v1.10)\n"
-           "usage: dgcpk a [-n] [-f] [-i] [-r<n>] <archive> <file>...\n"
+           "usage: dgcpk a [-n] [-f] [-i] [-r<n>] [-p<password>|-k<keyfile>] <archive> <file>...\n"
            "       dgcpk s [-S<n>] [-p<password>|-k<keyfile>] [-r<n>] <base> <file>\n"
            "  -n   do not compress\n"
            "  -f   one block per file\n"
            "  -i   identity: do not write the time stamps\n"
            "  -r<n>  append the recovery data (the parity table)\n"
            "  -S<n>  the size of a part of a spanning file (in bytes)\n"
-           "  -p   the password of an encrypted spanning file (-p secret)\n"
-           "  -k   the key file of an encrypted spanning file (-k mykey.key)\n"
+           "  -p   the password (-p secret)\n"
+           "  -k   the key file (-k mykey.key)\n"
            "\n"
            "  the command s writes the spanning files of a big file:\n"
            "  <base>0000.dgd, <base>0001.dgd, ... (and with -r the same\n"
@@ -1677,14 +1780,14 @@ int main(int argc, char **argv)
         return write_spanning(outpath, inpath, partsize, recovery, pw, pwlen);
     }
 
-    /* the archive encryption is not written by this packer - do not
-     * silently write a plain archive when -p / -k was given */
-    if (pwarg || keyfile) {
-        fprintf(stderr, "dgcpk: -p / -k are only supported by the spanning "
-                        "files (dgcpk s);\n"
-                        "        this packer does not write encrypted "
-                        "archives.\n");
-        return 1;
+    /* password for encrypted archive */
+    if (pwarg) {
+        pwlen = (u32)strlen(pwarg);
+        if (pwlen > sizeof(pw) - 1) pwlen = sizeof(pw) - 1;
+        memcpy(pw, pwarg, pwlen);
+    } else if (keyfile) {
+        pwlen = password_from_keyfile(keyfile, pw, sizeof(pw));
+        if (!pwlen) return 1;
     }
 
     {
@@ -1702,6 +1805,12 @@ int main(int argc, char **argv)
         }
     }
     if (!nents) usage();
+    if (!perfile && !nocompress) {
+        sort_entries(ents, nents);
+    } else if (perfile || nocompress) {
+        /* original tool also sorts? check - -f with -n still follows some order; but safer to sort same as normal */
+        sort_entries(ents, nents);
+    }
     coff = (u32 *)calloc(nents, sizeof(u32));
     csize = (u32 *)calloc(nents, sizeof(u32));
     if (!coff || !csize) { fprintf(stderr, "out of memory\n"); return 2; }
@@ -1730,10 +1839,16 @@ int main(int argc, char **argv)
     {
         buf_t blocks;
         memset(&blocks, 0, sizeof(blocks));
-        if (perfile) {
+        if (perfile || nocompress) {
             u32 off = 0;
             for (i = 0; i < nents; i++) {
                 buf_t blk, dgcc;
+                if (is_dir_ent(&ents[i])) {
+                    coff[i] = dgcchunk.len;
+                    csize[i] = 0;
+                    off += ents[i].size;
+                    continue;
+                }
                 memset(&blk, 0, sizeof(blk));
                 memset(&dgcc, 0, sizeof(dgcc));
                 put_data_block(alldata + off, ents[i].size, params, nocompress, &blk);
@@ -1746,15 +1861,69 @@ int main(int argc, char **argv)
                 free(blk.p);
             }
         } else {
-            buf_t blk, dgcc;
-            memset(&blk, 0, sizeof(blk));
-            memset(&dgcc, 0, sizeof(dgcc));
-            put_data_block(alldata, alldatasize, params, nocompress, &blk);
-            put_chunk(&dgcc, "DGCC", 0, blk.p, blk.len);
-            for (i = 0; i < nents; i++) { coff[i] = 0; csize[i] = dgcc.len; }
-            bput(&dgcchunk, dgcc.p, dgcc.len);
-            free(dgcc.p);
-            free(blk.p);
+            /* solid mode: group consecutive files by extension */
+            u32 off = 0;
+            u32 j = 0;
+            while (j < (u32)nents) {
+                char ext0[256];
+                int isd = is_dir_ent(&ents[j]);
+                if (isd) {
+                    coff[j] = dgcchunk.len;
+                    csize[j] = 0;
+                    j++;
+                    continue;
+                }
+                get_ext(ents[j].path, ext0, 256);
+                {
+                    u32 k = j;
+                    u32 totalg = 0;
+                    while (k < (u32)nents) {
+                        if (is_dir_ent(&ents[k])) break;
+                        {
+                            char ex[256];
+                            get_ext(ents[k].path, ex, 256);
+                            if (stricmp_local(ex, ext0)) break;
+                        }
+                        totalg += ents[k].size;
+                        k++;
+                    }
+                    /* build group buffer in order */
+                    {
+                        u8 *gbuf = (u8 *)malloc(totalg ? totalg : 1);
+                        buf_t blk, dgcc;
+                        u32 goff = 0, t;
+                        if (!gbuf) { fprintf(stderr, "out of memory\n"); return 2; }
+                        for (t = j; t < k; t++) {
+                            memcpy(gbuf + goff, alldata + off, ents[t].size);
+                            goff += ents[t].size;
+                            off += ents[t].size;
+                        }
+                        memset(&blk, 0, sizeof(blk));
+                        memset(&dgcc, 0, sizeof(dgcc));
+                        put_data_block(gbuf, totalg, params, 0, &blk);
+                        put_chunk(&dgcc, "DGCC", 0, blk.p, blk.len);
+                        /* assign each file in group the same record start; the
+                         * compressed size is an estimate (apportioned) */
+                        {
+                            u32 trec = 0;
+                            u32 tg = 0;
+                            u32 tt;
+                            for (tt = j; tt < k; tt++) tg += ents[tt].size;
+                            for (tt = j; tt < k; tt++) {
+                                coff[tt] = dgcchunk.len;
+                                /* approximate share */
+                                csize[tt] = (u32)(( (double)ents[tt].size / (double)(tg ? tg : 1) ) * (double)dgcc.len);
+                                if (csize[tt] == 0 && ents[tt].size) csize[tt] = 1;
+                            }
+                        }
+                        bput(&dgcchunk, dgcc.p, dgcc.len);
+                        free(dgcc.p);
+                        free(blk.p);
+                        free(gbuf);
+                    }
+                    j = k;
+                }
+            }
         }
         dgcsize = dgcchunk.len;
         free(blocks.p);
@@ -1769,6 +1938,8 @@ int main(int argc, char **argv)
         u64 ctime;
         u32 namelen = 0;
         memset(iarc, 0, sizeof(iarc));
+        iarc[0] = (pwlen && !spanning) ? 1 : 0; /* bit 0 encrypted */
+        if (identity) iarc[0] |= 2;
         memcpy(iarc + 4, " 001", 4);
         ctime = identity ? 0 : file_time(outpath, 1);
         memcpy(iarc + 16, &ctime, 8);
@@ -1780,6 +1951,11 @@ int main(int argc, char **argv)
         memcpy(iarc + 0x30, &total, 8);
         memcpy(iarc + 0x38, &idxtbl, 8);
         memcpy(iarc + 0x40, &namelen, 4);
+        if (pwlen && !spanning) {
+            crypt_t c;
+            crypt_setkey_pw1(&c, pw, pwlen);
+            crypt_encrypt(&c, iarc + 0x20, 48);
+        }
         put_chunk(&infochunk, "IARC", 0, iarc, 80);
     }
 
@@ -1840,6 +2016,52 @@ int main(int argc, char **argv)
         memset(&dgca, 0, sizeof(dgca));
         put_chunk(&dgca, "DATA", 0, dgcchunk.p, dgcchunk.len);
         put_chunk(&dgca, "INFO", 1, infochunk.p, infochunk.len);
+        if (pwlen && !spanning) {
+            /* encrypt DGCC records in DATA */
+            encrypt_dgcc_records(dgca.p, dgca.len, pw, pwlen);
+            /* encrypt DGCC records inside INFO payload */
+            {
+                /* INFO is a child chunk inside dgca payload */
+                {
+                    u32 p2 = 0;
+                    u32 dlen2 = dgca.len;
+                    while (p2 + 32 <= dlen2) {
+                        if (memcmp(dgca.p + p2, "INFO", 4) == 0) {
+                            u32 ip = p2 + 32;
+                            u32 ipend = ip + rd32le(dgca.p + p2 + 8);
+                            u32 q = ip;
+                            while (q + 32 <= ipend) {
+                                if (memcmp(dgca.p + q, "DGCC", 4) == 0) {
+                                    crypt_t c1, c2;
+                                    u32 ps2 = rd32le(dgca.p + q + 8);
+                                    if (ps2 > ipend - q - 32) break;
+                                    crypt_setkey_pw1(&c1, pw, pwlen);
+                                    crypt_encrypt(&c1, dgca.p + q, 32);
+                                    crypt_setkey_pw2(&c2, dgca.p + q, 32, pw, pwlen);
+                                    crypt_encrypt(&c2, dgca.p + q + 32, ps2);
+                                    q = q + 32 + ps2;
+                                    q = (q + 15) & ~15u;
+                                    continue;
+                                } else {
+                                    u32 psh2b = rd32le(dgca.p + q + 8);
+                                    u32 n2b = q + 32 + psh2b;
+                                    if (n2b <= q) break;
+                                    n2b = (n2b + 15) & ~15u;
+                                    q = n2b;
+                                }
+                            }
+                            break;
+                        } else {
+                            u32 psh3b = rd32le(dgca.p + p2 + 8);
+                            u32 n3b = p2 + 32 + psh3b;
+                            if (n3b <= p2) break;
+                            n3b = (n3b + 15) & ~15u;
+                            p2 = n3b;
+                        }
+                    }
+                }
+            }
+        }
         put_chunk(&out, "DGCA", 1, dgca.p, dgca.len);
         free(dgca.p);
     }
