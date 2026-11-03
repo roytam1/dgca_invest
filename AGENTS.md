@@ -11,11 +11,14 @@ dgcunp.c         unpacker / lister / repair tool written from this analysis
                  (MSVC6, C89)
 dgcpk.c          the packer (the archiver) written from this analysis
                  (MSVC6, C89)
-NOTES-dgca-format.md   full format + codec + crypto specification
+FORMAT.md        the format + codec + crypto specification (the successor of
+                 NOTES-dgca-format.md)
+README.md        the project overview, tools and build instructions
 ```
 
-Everything in `NOTES-dgca-format.md` is **verified against bytes produced by the tool
-itself** - not inferred from the decompiler alone.
+Everything in `FORMAT.md` is **verified against bytes produced by the tool
+itself** - not inferred from the decompiler alone. `NOTES-dgca-format.md` was
+folded into `FORMAT.md` and is no longer used.
 
 ---
 
@@ -42,7 +45,7 @@ Switches that matter for analysis:
 | `-n` | no compression -> every `DGCC` block becomes `tag 0` STORE. **This is the golden path**: with `-n` the index and name blobs are stored verbatim, so you get the exact plaintext of structures that are normally compressed. |
 | `-i` | identity -> all timestamps (archive *and* per-file) are zeroed. Combined with `-n` this makes the index blob **byte-for-byte deterministic**, so a `-i -n` archive and an `-i` archive of the same tree have *identical* index plaintext. That is how the codec was validated. |
 | `-f` | each-file mode (one `DGCC` per file) instead of solid |
-| `-p<pw>` | encryption (see `NOTES-dgca-format.md` section 8) |
+| `-p<pw>` | encryption (see `FORMAT.md` section 6) |
 
 Scratch area used during the analysis: `C:\Users\Roy\AppData\Local\Temp\opencode\dgca`
 (sample archives, Python prototypes). It is disposable - regenerate anything you need.
@@ -62,7 +65,7 @@ Scratch area used during the analysis: `C:\Users\Roy\AppData\Local\Temp\opencode
 
 ---
 
-## 3. Container format (summary - full spec in `NOTES-dgca-format.md`)
+## 3. Container format (summary - full spec in `FORMAT.md`)
 
 A DGC archive is a **tree of 32-byte-header chunks**:
 
@@ -72,7 +75,7 @@ struct Chunk {                 little endian
     uint32 hdr_size;           always 0x20
     uint32 payload_size;
     uint32 zero_0c;
-    uint32 flags;              1 on DGCA / INFO / DGCR
+    uint32 flags;              1 on DGCA / INFO / DGCR (and DGCD)
     uint32 align;              always 0x10
     uint32 crc_payload;        CRC-32 (zlib) of the payload
     uint32 crc_header;         CRC-32 of these 32 bytes with this field zeroed
@@ -95,8 +98,9 @@ DGCA
   (32-byte block header + stream A + stream B), `tag 2` COLUMNS (`size` = the stride, `size`
   `tag 1` blocks follow - the "column" method).
 * Per-file index entry (64 B): `+00` CRC-32 of the file, `+04` attributes, `+08/+10` FILETIME
-  create/modify, `+18` original size, `+20` "compressed" size, `+28` offset in the DATA
-  payload.
+  create/modify, `+18` original size, `+20` "compressed" size (an apportioned estimate in
+  solid mode), `+28` the record's offset in the DATA payload, `+30` the file's offset in
+  that record's output (all three u64).
 
 ### The spanning files `.dgd` / `.dgdr` (SOLVED)
 
@@ -120,18 +124,34 @@ DGCD
   92 bytes at `+4`, `key2 = SHA-512(the PLAINTEXT 96-byte material | password)` for the
   name, the DFDT and the DATA payload.
 * The DFDT payload: `+00` the CRC-32 of the whole file, `+04` 0x20, `+10` the FILETIME.
-* Full spec: `NOTES-dgca-format.md` section 12.
+* The recovery data's parts: part 1 = the parity of the pages per (row, column),
+  part 2 = the parity of the columns per (page, row), part 3 = a running CRC-32 of
+  each row (page 0, then page 1, ...).  The `DGCR`'s `INFO+0x2C` is the CRC-32 of the
+  bytes in front of the `DGCR` chunk (for a `.dgcr`, the whole archive).
+* Full spec: `FORMAT.md` section 7.
 
 `dgcpk s [-S<n>] [-p<pw>|-k<keyfile>] [-r<n>] <base> <file>` writes them (the parts
 `<base>%04d.dgd`, with `-r` also `<base>%04d.dgdr` - whose first part is shorter). With
 the same input file the output is **byte identical** to the original tool's.
+
+### The writer's ordering and grouping (measured, not required by the reader)
+
+A solid archive is **not** a single block per file group in an arbitrary
+order.  The tool sorts the entries (directories first by full path, then the
+files by extension, case-insensitive, no extension first, then by the file
+name), and a solid block is exactly the concatenation of the consecutive files
+with the same extension; with `-f` (each-file) and with `-n` (store) every
+file gets its own `DGCC`.  The data stream is always the concatenation of the
+files in index order, which is why the extractor can read it sequentially.
+`dgcpk` does not reproduce the ordering yet, so solid output differs from the
+tool's.
 
 ---
 
 ## 4. The codec (SOLVED - byte exact)
 
 The whole compression codec is cracked and verified against every archive in
-the work area.  The details are in `NOTES-dgca-format.md` section 6; this is
+the work area.  The details are in `FORMAT.md` section 4; this is
 the summary.
 
 Pipeline (encoder side, from the disassembly of `sub_425600`):
@@ -196,14 +216,16 @@ The traps that cost the most time (do not repeat them):
 * the restore pass walks the previous byte's tree **from the deepest node up**;
 * the gamma decoder returns the **level** for the levels 0 and 1;
 * the initial previous byte is 0xFF if the params' bit 0 is set (the opposite way round
-  desynchronises the coder);
+  desynchronises the coder; the tool sets it when the first byte of the *token buffer*
+  is 0 - not the first byte of the block, which can differ once the LZ stage applies);
 * the IFDT blob of a compressed archive differs from the blob of the stored twin (the
   "compressed size" field) - comparing the two is a false oracle.
 
-Still open: nothing in the codec itself.  The remaining unknowns are the cosmetic fields
-of NOTES-dgca-format.md 6.7 (the block flags' bit 0, the IARC flags, the index entry's
-csize/offset) and the quality items (solid mode, the LZ iteration that does not settle on
-every input).
+Still open: nothing in the codec itself.  The remaining findings are folded into
+`FORMAT.md` (section 8 lists the fields that are not specified).  The open quality
+items are the solid writer (the ordering and grouping is now known and documented in
+section 3, but `dgcpk` does not reproduce it yet) and the LZ iteration that does not
+settle on every input.
 
 
 ## 5. Build & test the unpacker
@@ -249,11 +271,11 @@ Current state of `dgcunp.c`:
 | the crypto of DGCA v1.10 (SHA-512, MT19937, PRNG, cipher, key derivation) | working - byte exact, verified against the original binary |
 | the recovery data (`-R`): the parity table, the repair, the archive's CRC-32 | working - a damaged `.dgcr` is repaired and extracted without errors |
 | the packer (`dgcpk.c`) | working - `dgcac.exe` reads back the archives it writes and the extracted files are byte identical; it writes the column method (tag 2) and the LZ stage (flags bit 1) too |
-| encrypted archives (`-p` / `-k`) | working - the two keys are cracked (see `NOTES-dgca-format.md` 8.7); the extracted files are byte identical to `dgcac.exe`'s |
+| encrypted archives (`-p` / `-k`) | working - the two keys are cracked (see `FORMAT.md` 6.6); the extracted files are byte identical to `dgcac.exe`'s |
 | the spanning files (`.dgd` / `.dgdr`) | working - the parts are found in the directory, put together, checked against the SHA-512 of the INFO chunk and written out; `-R` applies the recovery data of a `.dgdr` |
 | the packer writes the spanning files too | working - `dgcpk s` writes byte identical `.dgd` / `.dgdr` files (the plain, the encrypted and the recovery variant) |
 | the match coder (the params' bit 1) | decoded (`cm_match`) and encoded (`cm_match_put`); the packer tries it per column |
-| the LZ stage (flags bit 1) | decoded (the chain walk) and encoded (the rank iteration of NOTES 6.2); the packer keeps the plain stream when the iteration does not settle |
+| the LZ stage (flags bit 1) | decoded (the chain walk) and encoded (the rank iteration of FORMAT.md 4.8); the packer keeps the plain stream when the iteration does not settle |
 | the column method (tag 2) | decoded and encoded; the packer writes it when the lag test of `sub_423F90` fires, each column with the best of the literal/match coder and the LZ stage |
 
 The regression test: extract every archive in the work area and check that
@@ -321,7 +343,7 @@ Three bugs that cost real time and are worth remembering:
   `dgcac.exe.lst`.
 * `dgcunp.c` is C89 for MSVC 6 (`__int64`, no `//` comments, declarations at the top of a
   block); it must keep building with `cl` from VC98.
-* Keep new findings in `NOTES-dgca-format.md` and update section 4 of this file when a stage
+* Keep new findings in `FORMAT.md` and update section 4 of this file when a stage
   of the codec is cracked.
 * Keep this file and the notes plain ASCII: the editor used here can silently introduce
   UTF-8 punctuation that makes later patches fail to match.

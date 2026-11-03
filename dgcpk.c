@@ -1134,8 +1134,10 @@ typedef struct {
 /* ------------------------- the recovery data ------------------------- *
  *  the parity table of the archive: the matrix is
  *  pages x rows x 256 columns 4 byte words (the archive's bytes padded
- *  with zeros), part 1 is the column parity, part 2 the row parity and
- *  part 3 the offsets of the row blocks.  The whole thing is encrypted
+ *  with zeros), part 1 is the parity of the pages for every (row,
+ *  column), part 2 the parity of the columns for every (page, row) and
+ *  part 3 the CRC-32 of every row (a running CRC-32 over the row's
+ *  words in page 0, then page 1, ...).  The whole thing is encrypted
  *  with the fixed key of the SecureCryptograph class. */
 
 /* the rows and the pages of the matrix (the same formula as the tool) */

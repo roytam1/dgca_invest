@@ -1,0 +1,20 @@
+# build artifacts
+*.exe
+*.obj
+*.ilk
+*.pdb
+
+# test archives and spanning files used during the analysis
+*.dgc
+*.dgcr
+*.dgd
+*.dgdr
+*.repaired
+
+# IDA / analysis scratch
+*.mem
+*.pat
+*.pats
+
+# analysis scratch / extracted output
+/out/

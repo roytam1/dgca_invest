@@ -777,7 +777,9 @@ static int dgc_decompress(const u8 *pay, u32 len, buf_t *out)
 typedef struct {
     u32 crc, attr;
     u64 ctime, mtime, size;
-    u32 csize, doff;
+    u64 csize;      /* the record's padded size (a solid-block estimate) */
+    u64 doff;       /* the record's offset in the DATA payload */
+    u64 doff2;      /* the file's offset in the record's output */
     u32 nameoff, namelen;
 } entry_t;
 
@@ -818,8 +820,9 @@ static void parse_index(chunk_t *ifdt)
         g_entries[e].ctime = rd64(row + 8);
         g_entries[e].mtime = rd64(row + 16);
         g_entries[e].size  = rd64(row + 24);
-        g_entries[e].csize = rd32(row + 32);
-        g_entries[e].doff  = rd32(row + 36);
+        g_entries[e].csize = rd64(row + 0x20);
+        g_entries[e].doff  = rd64(row + 0x28);
+        g_entries[e].doff2 = rd64(row + 0x30);
     }
     g_nentry = (int)n;
 }
@@ -1326,7 +1329,8 @@ static int password_from_keyfile(const char *path, u8 *out, u32 outmax)
  *      the archive = rows x 256 columns x pages words
  *      part 1: the parity of the pages for every (row, column)
  *      part 2: the parity of the columns for every (page, row)
- *      part 3: the offsets of the row blocks (a copy of the data)
+ *      part 3: the CRC-32 of every row (a running CRC over the row's
+ *              words in page 0, then page 1, ...)
  *  It is encrypted with the fixed key of the SecureCryptograph class.
  * ------------------------------------------------------------------ */
 static void dgcr_report(chunk_t *dgcr, int verbose)
@@ -2129,7 +2133,7 @@ int main(int argc, char **argv)
             printf("%-40s %10u %10u %08x\n",
                    (const char *)g_namepool + g_entries[k].nameoff,
                    (unsigned)(u32)g_entries[k].size,
-                   g_entries[k].csize, g_entries[k].crc);
+                   (unsigned)(u32)g_entries[k].csize, g_entries[k].crc);
     }
 
     if (listonly || !outdir) {
