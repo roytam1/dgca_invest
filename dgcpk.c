@@ -1585,7 +1585,7 @@ static void add_entry(entry_t **pents, int *nents, int *cap, const char *file,
     ents[*nents].size = (u32)st->st_size;
     ents[*nents].attr = (st->st_mode & S_IFDIR) ? 0x10 : 0x20;
     ents[*nents].ctime = identity ? 0 : file_time(file, 0);
-    ents[*nents].mtime = identity ? 0 : file_time(file, 1);
+    ents[*nents].mtime = file_time(file, 1);
     ents[*nents].crc = 0;
     (*nents)++;
     if (st->st_mode & S_IFDIR) {
@@ -1941,7 +1941,12 @@ int main(int argc, char **argv)
         iarc[0] = (pwlen && !spanning) ? 1 : 0; /* bit 0 encrypted */
         if (identity) iarc[0] |= 2;
         memcpy(iarc + 4, " 001", 4);
-        ctime = identity ? 0 : file_time(outpath, 1);
+        if (identity) ctime = 0;
+        else {
+            FILETIME ft;
+            GetSystemTimeAsFileTime(&ft);
+            ctime = ((u64)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+        }
         memcpy(iarc + 16, &ctime, 8);
         for (i = 0; i < nents; i++) {
             total += ents[i].size;
