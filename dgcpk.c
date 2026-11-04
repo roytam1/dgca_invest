@@ -5,18 +5,23 @@
  *  a DGCA chunk with a DATA chunk (the compressed blocks) and an INFO
  *  chunk (the IARC, the IFDT and the IFNM).
  *
- *  The format is described in NOTES-dgca-format.md; the codec is the
+ *  The format is described in FORMAT.md; the codec is the
  *  inverse of the one in dgcunp.c:
  *      the data -> the pre-transform (an LZ77 with an implicit distance)
  *                 -> the literals + the model stream
+ *              -> the LZ stage (a permutation of the literals)
  *              -> the CM literal coder (stream A) and the gamma symbol
  *                 coder (stream B)
  *
- *  usage: dgcpk a [-n] [-f] [-i] [-r<n>] <archive> <file>...
+ *  usage: dgcpk a [-n] [-f] [-i] [-r<n>] [-p<password>|-k<keyfile>]
+ *             <archive> <file>...
+ *         dgcpk s [-S<n>] [-p<password>|-k<keyfile>] [-r<n>] <base> <file>
  *         -n     do not compress (the blocks are stored)
  *         -f     one block per file (not the solid mode)
  *         -i     identity: do not write the time stamps
  *         -r<n>  append the recovery data (the parity table)
+ *         -p     encryption password
+ *         -k     encryption key file
  * ------------------------------------------------------------------ */
 
 #include <stdio.h>
@@ -666,9 +671,13 @@ static void pre_transform(rng_t *me, const u8 *data, u32 size,
         u32 cand = tbl[key];
         u32 mlen = 0;
         if (cand != 0xFFFFFFFFu && cand < pos && data[cand] == data[pos]) {
-            u32 dist = pos - cand;
+            /* the match extension has NO distance cap (sub_424C30): it runs
+             * while the bytes compare equal, up to the end of the block.
+             * A distance-1 match chases the write position, which the
+             * decoder's forward copy handles (c_A4096.dgc: 3 literals +
+             * one match of 4093 with dist = 1). */
             u32 l = 1;
-            while (pos + l < size && l < dist && data[cand + l] == data[pos + l]) l++;
+            while (pos + l < size && data[cand + l] == data[pos + l]) l++;
             mlen = l;
         }
         if (mlen >= minlen) {
@@ -798,109 +807,120 @@ static void match_stream(const u8 *data, u32 n, u32 params, int firstbyte_zero,
  * lz_inverse) inverts it; `start` is the rank of the first byte.
  * It reproduces the original's token buffer byte for byte (the text.txt
  * block of all.dgc: start 50856, stream A 19649). */
-#define LZ_MAX (8u * 1024u * 1024u)   /* the rank arrays are 16 bytes a byte */
+/* ------------------- the LZ stage (sub_428270) -------------------
+ *  The token buffer is the BWT column of the literals: the stable rank
+ *  of every cyclic rotation, tok[i] = the last byte of the i-th sorted
+ *  rotation, start = the rank of rotation 0 (the block's v22).  The
+ *  decoder's chain walk (dgcunp.c, lz_inverse) inverts it.
+ *  The ranks are computed with the suffix-array DOUBLING algorithm
+ *  (Manber-Myers on the cyclic string): exact, stable on ties (equal
+ *  rotations order by position - rotation 0 first, which fixes start),
+ *  O(n log^2 n) and always convergent - unlike the rank iteration of
+ *  FORMAT.md 4.8, which cycles on some inputs (the tool computes the
+ *  same fixed point with a radix sort and a cycle merge). */
+#define LZ_MAX (2u * 1024u * 1024u)   /* the rank arrays are 12 bytes a byte */
 
-/* the direct BWT: sort the cyclic rotations lexicographically and take the
- * last column.  This always finds a fixed point (the BWT always exists),
- * unlike the rank iteration which may cycle.  Used as a fallback when the
- * iteration does not converge. */
-static const u8 *g_bwt_data;
-static u32 g_bwt_n;
+static u32 *g_sa_rank;
+static u32 g_sa_n, g_sa_h;
 
-static int bwt_cmp(const void *pa, const void *pb)
+static int sa_cmp(const void *pa, const void *pb)
 {
     u32 i = *(const u32 *)pa;
     u32 j = *(const u32 *)pb;
-    u32 k;
-    for (k = 0; k < g_bwt_n; k++) {
-        u8 ci = g_bwt_data[(i + k) % g_bwt_n];
-        u8 cj = g_bwt_data[(j + k) % g_bwt_n];
-        if (ci != cj) return (int)ci - (int)cj;
-    }
-    return 0;
-}
-
-static int lz_stage_bwt(const u8 *data, u32 n, u8 *tok, u32 *start)
-{
-    u32 *rot;
-    u32 i;
-    if (!n) { *start = 0; return 1; }
-    if (n > LZ_MAX) return 0;
-    rot = (u32 *)malloc(sizeof(u32) * n);
-    if (!rot) return 0;
-    for (i = 0; i < n; i++) rot[i] = i;
-    g_bwt_data = data;
-    g_bwt_n = n;
-    qsort(rot, n, sizeof(u32), bwt_cmp);
-    for (i = 0; i < n; i++) {
-        if (rot[i] == 0) { *start = i; break; }
-    }
-    for (i = 0; i < n; i++) {
-        u32 j = rot[i];
-        tok[i] = data[(j + n - 1) % n];
-    }
-    free(rot);
-    return 1;
+    u32 ri = g_sa_rank[i];
+    u32 rj = g_sa_rank[j];
+    if (ri != rj) return ri < rj ? -1 : 1;
+    ri = g_sa_rank[(i + g_sa_h) % g_sa_n];
+    rj = g_sa_rank[(j + g_sa_h) % g_sa_n];
+    if (ri != rj) return ri < rj ? -1 : 1;
+    /* equal so far: the stable order by the rotation's position */
+    if (i < j) return -1;
+    return i > j;
 }
 
 static int lz_stage(const u8 *data, u32 n, u8 *tok, u32 *start)
 {
-    u32 *rank, *newr, *a, *inva;
-    u32 base[256], cnt[256], w[256];
-    u32 i, k, v, it;
-    int ok = 0;
+    u32 *rank, *order, *newr;
+    u32 h, i, k;
 
     if (!n) { *start = 0; return 1; }
     if (n > LZ_MAX) return 0;
-
-    /* for small blocks, use the direct BWT (always converges) */
-    if (n <= 8192) {
-        return lz_stage_bwt(data, n, tok, start);
+    rank  = (u32 *)malloc(sizeof(u32) * n);
+    order = (u32 *)malloc(sizeof(u32) * n);
+    newr  = (u32 *)malloc(sizeof(u32) * n);
+    if (!rank || !order || !newr) {
+        free(rank); free(order); free(newr);
+        return 0;
     }
-
-    /* for large blocks, try the rank iteration (fast, usually converges) */
-    rank = (u32 *)malloc(sizeof(u32) * n);
-    newr = (u32 *)malloc(sizeof(u32) * n);
-    a    = (u32 *)malloc(sizeof(u32) * n);
-    inva = (u32 *)malloc(sizeof(u32) * n);
-    if (!rank || !newr || !a || !inva) {
-        free(rank); free(newr); free(a); free(inva);
-        return lz_stage_bwt(data, n, tok, start);
+    for (i = 0; i < n; i++) { order[i] = i; rank[i] = data[i]; }
+    g_sa_n = n;
+    g_sa_rank = rank;
+    g_sa_h = 0;
+    qsort(order, n, sizeof(u32), sa_cmp);
+    /* the initial ranks: by byte value, ties by position */
+    newr[order[0]] = 0;
+    for (k = 1; k < n; k++) {
+        i = order[k - 1];
+        newr[order[k]] = newr[i] + (data[order[k]] != data[i]);
     }
-    memset(cnt, 0, sizeof(cnt));
-    for (i = 0; i < n; i++) cnt[data[i]]++;
-    base[0] = 0;
-    for (v = 1; v < 256; v++) base[v] = base[v - 1] + cnt[v - 1];
-    /* the stable rank by value */
-    memset(w, 0, sizeof(w));
-    for (i = 0; i < n; i++) {
-        v = data[i];
-        rank[i] = base[v] + w[v]++;
-    }
-    for (it = 0; it < 128; it++) {
-        for (k = 0; k < n; k++) a[k] = rank[(k + 1) % n];
-        for (k = 0; k < n; k++) inva[a[k]] = k;
-        /* the members of every value group, in the order of their rank
-         * (i.e. by a[]), get the ranks base[v]..base[v]+cnt[v]-1 */
-        memcpy(w, base, sizeof(w));
+    memcpy(rank, newr, sizeof(u32) * n);
+    for (h = 1; h < n; h <<= 1) {
+        u32 done = 1;
+        /* check whether all ranks are distinct (the sort is finished) */
         for (k = 0; k < n; k++) {
-            i = inva[k];
-            v = data[i];
-            newr[i] = w[v]++;
+            if (rank[order[k]] != k) { done = 0; break; }
         }
-        if (!memcmp(newr, rank, sizeof(u32) * n)) { ok = 1; break; }
+        if (done) break;
+        g_sa_h = h;
+        qsort(order, n, sizeof(u32), sa_cmp);
+        newr[order[0]] = 0;
+        for (k = 1; k < n; k++) {
+            u32 pi = order[k - 1], ci = order[k];
+            u32 same = (rank[pi] == rank[ci]) &&
+                       (rank[(pi + h) % n] == rank[(ci + h) % n]);
+            newr[ci] = newr[pi] + !same;
+        }
         memcpy(rank, newr, sizeof(u32) * n);
     }
-    if (ok) {
-        for (k = 0; k < n; k++) tok[a[k]] = data[k];
-        *start = rank[0];
-    } else {
-        /* iteration did not converge: fall back to direct BWT */
-        free(rank); free(newr); free(a); free(inva);
-        return lz_stage_bwt(data, n, tok, start);
+    /* the token: the last byte of every sorted rotation */
+    for (k = 0; k < n; k++) {
+        u32 s = order[k];
+        tok[k] = data[s ? s - 1 : n - 1];
     }
-    free(rank); free(newr); free(a); free(inva);
-    return ok;
+    *start = rank[0];
+    free(rank); free(order); free(newr);
+    return 1;
+}
+
+/* the per-block tuning of the CM shifts (sub_4244E0).  r = the fraction of
+ * the TOKEN bytes equal to their predecessor; the first byte counts when it
+ * is 0 (the binary's v3 starts at 0).  The token is the LZ-staged buffer,
+ * so r measures the run structure of the BWT output.  `column` selects the
+ * second set (the coder's this[15] flag - the column sub-blocks). */
+static u32 tune_params(const u8 *tok, u32 n, int column)
+{
+    u32 p_lit = 6, p_pairb = 7, p_pair = 7, p_ctx = 5, p_run = 5;
+    u32 i, same = 0;
+    double r;
+    if (!n) return (6u << 24) | (4u << 28);
+    for (i = 1; i < n; i++) if (tok[i] == tok[i - 1]) same++;
+    if (tok[0] == 0) same++;
+    r = (double)same / (double)n;
+    if (column) {
+        /* this[15] set: p_run 4, p_ctx 5, then the second threshold set */
+        p_run = 4;
+        if (r > 0.05) { p_lit = 4; p_pairb = 5; p_pair = 5; p_ctx = 5; p_run = 4; }
+        if (r > 0.6)  { p_lit = 3; p_pairb = 4; p_pair = 4; p_ctx = 4; p_run = 4; }
+        if (r > 0.9)  { p_lit = 2; p_pairb = 3; p_pair = 3; p_ctx = 4; p_run = 4; }
+    } else {
+        if (r > 0.03) { p_lit = 5; p_pairb = 6; p_pair = 6; p_run = 5; }
+        if (r > 0.05) { p_lit = 4; p_pairb = 5; p_pair = 5; p_run = 5; }
+        if (r > 0.2)  { p_lit = 3; p_pairb = 5; p_pair = 4; p_run = 4; }
+        if (r > 0.4)  { p_lit = 2; p_pairb = 4; p_pair = 4; p_run = 4; }
+        if (r > 0.6)  { p_lit = 2; p_pairb = 3; p_pair = 3; p_run = 4; }
+    }
+    return (p_lit << 4) | (p_pairb << 8) | (p_pair << 12) |
+           (p_ctx << 16) | (p_run << 20) | (6u << 24) | (4u << 28);
 }
 
 static void compress_block(const u8 *data, u32 size, u32 params,
@@ -912,7 +932,7 @@ static void compress_block(const u8 *data, u32 size, u32 params,
     int lz = 0;
     int minlen_exp = (params >> 24) & 0xF;
     int model_shift = (params >> 28) & 0xF;
-    int firstbyte_zero = (params & 1) != 0;
+    u32 eparams;
 
     memset(&lits, 0, sizeof(lits));
     memset(&model, 0, sizeof(model));
@@ -925,30 +945,24 @@ static void compress_block(const u8 *data, u32 size, u32 params,
         pre_transform(&me, data, size, minlen_exp, model_shift, &lits, &model);
         rng_flush(&me);
     }
-    /* the LZ stage: a permutation of the literals (flags bit 1).  The
-     * fixed point iteration does not settle on every input, so the plain
-     * stream is coded as well and the smaller of the two is kept. */
-    cm_stream(lits.p, lits.len, params, firstbyte_zero, &A);
-    if (lits.len) {
-        buf_t A2;
-        memset(&A2, 0, sizeof(A2));
-        tok = (u8 *)malloc(lits.len);
-        if (tok && lz_stage(lits.p, lits.len, tok, &start)) {
-            cm_stream(tok, lits.len, params, firstbyte_zero, &A2);
-            if (A2.len < A.len) {
-                lz = 1;
-                free(A.p);
-                A = A2;
-            } else {
-                free(A2.p);
-            }
-        }
+    /* the LZ stage (flags bit 1): the tool's cycle merge always settles, so
+     * the stage is on every pre-transform block of the reference archives -
+     * it is NOT optional and NOT compared with the plain stream. */
+    tok = (u8 *)malloc(lits.len ? lits.len : 1);
+    if (tok && lz_stage(lits.p, lits.len, tok, &start)) {
+        lz = 1;
     }
+    /* the per-block tuning runs on the STAGED token (sub_425600 calls
+     * sub_4244E0 after sub_428270) */
+    eparams = tune_params(lz ? tok : lits.p, lits.len, 0);
+    if (lits.len && (lz ? tok[0] : lits.p[0]) == 0) eparams |= 1;
+    if (lz) cm_stream(tok, lits.len, eparams, (eparams & 1) != 0, &A);
+    else    cm_stream(lits.p, lits.len, eparams, (eparams & 1) != 0, &A);
     /* the block header */
     bput32(out, 1);           /* the tag */
     bput32(out, size);        /* the original size */
-    bput32(out, lz ? 0x07 : 0x05);  /* the flags: pre-transform (+ LZ), bit 0 always set */
-    bput32(out, params);
+    bput32(out, lz ? 0x07 : 0x05);  /* bit 0 + (LZ) + pre-transform */
+    bput32(out, eparams);
     bput32(out, lz ? start : 0);    /* v22: the chain walk's start */
     bput32(out, lits.len);    /* v7: the token buffer's size */
     bput32(out, A.len);
@@ -997,13 +1011,18 @@ static double col_spread(const u8 *p, u32 n)
 }
 
 /* the stride of the column method (1..16), 0 when the data is not
- * "column friendly".  sub_423F90: the mean |x[i]-x[i-d]| is computed for
- * every lag; the columns are used when the best lag is far better than
- * the average one (best * 4 < the average). */
+ * "column friendly" - sub_423F90 verbatim:
+ *   - the mean |x[i]-x[i-d]| for every lag d = 1..16 (n >= 0x400 only);
+ *   - best = the argmin lag, avg = the mean of the 16 means;
+ *   - a secondary test when best > 1: walk the chain i = s, s+best, ...
+ *     for every phase s in [best, 2*best) and take the min/max chain
+ *     mean; worst*2 > best*3 sets the column flag;
+ *   - best*4 < avg sets the flag; 2*best >= avg clears it again. */
 static int choose_stride(const u8 *p, u32 n)
 {
     double m[17], avg = 0.0, best;
     int d, bi;
+    int col = 0;
     if (n < 0x400) return 0;
     for (d = 1; d <= 16; d++) {
         u64 sum = 0;
@@ -1019,8 +1038,34 @@ static int choose_stride(const u8 *p, u32 n)
     avg /= 16.0;
     best = m[1]; bi = 1;
     for (d = 2; d <= 16; d++) if (m[d] < best) { best = m[d]; bi = d; }
-    if (best * 4.0 < avg) return bi;
-    return 0;
+    if (bi > 1) {
+        /* the chain test: the de-interleaved column's own delta, over
+         * every phase offset of the stride.  The best chain mean then
+         * REPLACES the plain lag mean (sub_423F90 writes v61[0] back into
+         * the best-lag slot), so the main test and the override below run
+         * on it - pcm16.bin: the plain mean 38.2 fails best*4 < avg and
+         * 2*best >= avg, but the best chain mean 4.7 passes both. */
+        double cbest = 0.0, cworst = 0.0;
+        int s;
+        for (s = 0; s < bi; s++) {
+            u64 sum = 0;
+            u32 i, cnt = 0;
+            double cm;
+            for (i = (u32)(s + bi); i < n; i += (u32)bi) {
+                int v = (int)p[i] - (int)p[i - (u32)bi];
+                sum += (u64)(v < 0 ? -v : v);
+                cnt++;
+            }
+            cm = cnt ? (double)sum / (double)cnt : 0.0;
+            if (!s || cm < cbest) cbest = cm;
+            if (!s || cm > cworst) cworst = cm;
+        }
+        if (cworst * 2.0 > cbest * 3.0) col = 1;
+        best = cbest;
+    }
+    if (best * 4.0 < avg) col = 1;
+    if (best + best >= avg) col = 0;
+    return col ? bi : 0;
 }
 
 /* the forward delta (the inverse of inverse_delta in dgcunp.c) */
@@ -1073,68 +1118,89 @@ static int column_block(const u8 *data, u32 size, buf_t *out)
         }
         if (order == 1) memcpy(col, d1, n);
         else if (order == 2) memcpy(col, d2, n);
-        /* heuristics from FORMAT.md 4.10 */
+        /* heuristics from FORMAT.md 4.10; the tuning uses the second set
+         * (the coder's this[15] flag) on the column's staged token */
         match = (s1 < 5.0) ? 1 : 0;
         clz = (order != 2 && s1 >= 1.0) ? 1 : 0;
-        memset(&A, 0, sizeof(A));
-        if (clz) {
-            ctok = (u8 *)malloc(n ? n : 1);
-            if (ctok && lz_stage(col, n, ctok, &cstart)) {
-                if (match) match_stream(ctok, n, 0x46443322u, 0, &A);
-                else cm_stream(ctok, n, 0x46443320u, 0, &A);
-            } else {
-                clz = 0;
-                cstart = 0;
-                if (ctok) free(ctok);
-                ctok = NULL;
-                if (match) match_stream(col, n, 0x46443322u, 0, &A);
-                else cm_stream(col, n, 0x46443320u, 0, &A);
-            }
-        } else {
+        {
+            u32 cparams;
+            memset(&A, 0, sizeof(A));
             ctok = NULL;
-            cstart = 0;
-            if (match) match_stream(col, n, 0x46443322u, 0, &A);
-            else cm_stream(col, n, 0x46443320u, 0, &A);
+            if (clz) {
+                ctok = (u8 *)malloc(n ? n : 1);
+                if (ctok && lz_stage(col, n, ctok, &cstart)) {
+                    cparams = tune_params(ctok, n, 1);
+                    if (n && ctok[0] == 0) cparams |= 1;
+                    if (match) {
+                        cparams |= 2;
+                        match_stream(ctok, n, cparams, (cparams & 1) != 0, &A);
+                    } else {
+                        cm_stream(ctok, n, cparams, (cparams & 1) != 0, &A);
+                    }
+                } else {
+                    clz = 0;
+                    cstart = 0;
+                    free(ctok);
+                    ctok = NULL;
+                    cparams = tune_params(col, n, 1);
+                    if (n && col[0] == 0) cparams |= 1;
+                    if (match) {
+                        cparams |= 2;
+                        match_stream(col, n, cparams, (cparams & 1) != 0, &A);
+                    } else {
+                        cm_stream(col, n, cparams, (cparams & 1) != 0, &A);
+                    }
+                }
+            } else {
+                cstart = 0;
+                cparams = tune_params(col, n, 1);
+                if (n && col[0] == 0) cparams |= 1;
+                if (match) {
+                    cparams |= 2;
+                    match_stream(col, n, cparams, (cparams & 1) != 0, &A);
+                } else {
+                    cm_stream(col, n, cparams, (cparams & 1) != 0, &A);
+                }
+            }
+            bput32(out, 1);
+            bput32(out, n);
+            bput32(out, ((u32)order << 16) | (clz ? 3 : 1));
+            bput32(out, cparams);
+            bput32(out, clz ? cstart : 0);   /* v22 */
+            bput32(out, n);                  /* v7 */
+            bput32(out, A.len);
+            bput32(out, 0);                  /* lenB */
+            bput(out, A.p, A.len);
+            free(ctok);
+            free(A.p);
         }
-        bput32(out, 1);
-        bput32(out, n);
-        bput32(out, ((u32)order << 16) | (clz ? 3 : 1));
-        bput32(out, match ? 0x46443322u : 0x46443320u);
-        bput32(out, clz ? cstart : 0);   /* v22 */
-        bput32(out, n);                  /* v7 */
-        bput32(out, A.len);
-        bput32(out, 0);                  /* lenB */
-        bput(out, A.p, A.len);
-        free(ctok);
-        free(A.p);
     }
     free(col); free(d1); free(d2);
     return 1;
 }
 
-/* one data block: stored, the plain compressed block, or the columns */
+/* one data block: stored, the plain compressed block, or the columns.
+ * sub_425600: the coder (plain or columns) is chosen by the lag test and
+ * the this[15] flag; the store fallback checks the CODED size against
+ * size + 8 regardless of which path produced it. */
 static void put_data_block(const u8 *data, u32 size, u32 params, int nocompress,
                            buf_t *out)
 {
-    buf_t plain, col;
+    buf_t blk;
     if (nocompress) { store_block(data, size, out); return; }
-    memset(&plain, 0, sizeof(plain));
-    compress_block(data, size, params, &plain);
-    if (plain.len >= size + 8) {      /* the writer stores when it does not pay */
+    memset(&blk, 0, sizeof(blk));
+    if (!column_block(data, size, &blk)) {
+        free(blk.p);
+        memset(&blk, 0, sizeof(blk));
+        compress_block(data, size, params, &blk);
+    }
+    if (blk.len >= size + 8) {      /* the writer stores when it does not pay */
+        free(blk.p);
         store_block(data, size, out);
-        free(plain.p);
         return;
     }
-    memset(&col, 0, sizeof(col));
-    if (column_block(data, size, &col) && col.len < plain.len) {
-        bput(out, col.p, col.len);
-        free(col.p);
-        free(plain.p);
-        return;
-    }
-    free(col.p);
-    bput(out, plain.p, plain.len);
-    free(plain.p);
+    bput(out, blk.p, blk.len);
+    free(blk.p);
 }
 
 /* ----------------------------- the chunks ----------------------------- */
@@ -1909,10 +1975,18 @@ int main(int argc, char **argv)
                 }
                 memset(&blk, 0, sizeof(blk));
                 memset(&dgcc, 0, sizeof(dgcc));
+                /* a 0-byte file contributes no DGCC record (c_empty.dgc /
+                 * n_empty.dgc: DATA psize = 0) - only coff/csize 0 in the
+                 * index */
+                coff[i] = dgcchunk.len;
+                csize[i] = 0;
+                if (!ents[i].size) {
+                    off += ents[i].size;
+                    continue;
+                }
                 put_data_block(alldata + off, ents[i].size, params, nocompress, &blk);
                 off += ents[i].size;
                 put_chunk(&dgcc, "DGCC", 0, blk.p, blk.len);
-                coff[i] = dgcchunk.len;
                 csize[i] = dgcc.len;
                 bput(&dgcchunk, dgcc.p, dgcc.len);
                 free(dgcc.p);
@@ -1947,9 +2021,20 @@ int main(int argc, char **argv)
                     }
                     /* build group buffer in order */
                     {
-                        u8 *gbuf = (u8 *)malloc(totalg ? totalg : 1);
+                        u8 *gbuf;
                         buf_t blk, dgcc;
                         u32 goff = 0, t;
+                        if (!totalg) {
+                            /* a group of only 0-byte files: no DGCC record
+                             * (c_empty.dgc: DATA psize = 0) */
+                            for (t = j; t < k; t++) {
+                                coff[t] = dgcchunk.len;
+                                csize[t] = 0;
+                            }
+                            j = k;
+                            continue;
+                        }
+                        gbuf = (u8 *)malloc(totalg);
                         if (!gbuf) { fprintf(stderr, "out of memory\n"); return 2; }
                         for (t = j; t < k; t++) {
                             memcpy(gbuf + goff, alldata + off, ents[t].size);

@@ -57,20 +57,25 @@ so long UTF-8 names (longer than `MAX_PATH`) are written with the wide APIs.
 ## Using dgcpk
 
 ```powershell
-dgcpk a [-n] [-f] [-i] [-r<n>] <archive> <file-or-folder>...
+dgcpk a [-n] [-f] [-i] [-r<n>] [-p<password>|-k<keyfile>] <archive> <file-or-folder>...
 dgcpk s [-S<n>] [-p<password>|-k<keyfile>] [-r<n>] <base> <file>
 ```
 
 * `-n` no compression (every block is a tag 0 STORE)
 * `-f` one block per file (otherwise the tool groups files by extension into
   solid blocks)
-* `-i` identity mode: no timestamps are written
+* `-i` identity mode: the archive and per-file creation timestamps are zeroed
+  (the modification time is kept, as in the original tool)
 * `-r<n>` append the recovery data (`-r1` ... `-r9`, ~0.8 % ... 100 % redundancy)
+* `-p` / `-k` encryption (the same crypto as the original: the IARC tail with
+  key1, every `DGCC` header and payload with key1/key2)
 * `-S<n>` the size of a spanning-file part
 * `s` writes the `<base>0000.dgd` (and with `-r`, the `.dgdr`) parts
 
-`dgcpk` does not write encrypted archives yet; `dgcpk a` refuses `-p`/`-k`
-instead of silently writing a plain one.
+The packer reproduces the original tool's output byte for byte: 27 reference
+archives from the analysis (stored, compressed, solid, each-file, column
+method, identity, empty files, multi-file trees) match in every DATA / IFDT /
+IFNM block, and `dgcac.exe k` passes on the packer's archives.
 
 ## Verification
 
@@ -100,9 +105,9 @@ and `dgcac.exe k` passes).
 | the v1.10 crypto (SHA-512, MT19937, key schedule, cipher) | byte exact |
 | recovery data (`-R`) | a three-word-damaged `.dgcr` is repaired and extracts |
 | spanning files (`.dgd` / `.dgdr`, reassembly, SHA-512 check) | working |
-| packer: archives, solid mode, column method, LZ stage, match coder | `dgcac.exe` reads its archives back byte-identically |
-| packer: encrypted archives | not written yet |
-| the tool's solid grouping / entry ordering | reverse engineered (by extension groups), not implemented in `dgcpk` |
+| packer: archives, solid mode, column method, LZ stage, match coder, per-block tuning | byte-identical to the tool on 27 reference archives; `dgcac.exe k` passes |
+| packer: encrypted archives (`-p` / `-k`) | working - verified with `dgcunp` extraction (CRC matches) |
+| the tool's solid grouping / entry ordering | implemented (extension groups, directories first, 0-byte files get no record) |
 
 ## Notes and limitations
 

@@ -143,8 +143,33 @@ name), and a solid block is exactly the concatenation of the consecutive files
 with the same extension; with `-f` (each-file) and with `-n` (store) every
 file gets its own `DGCC`.  The data stream is always the concatenation of the
 files in index order, which is why the extractor can read it sequentially.
-`dgcpk` does not reproduce the ordering yet, so solid output differs from the
-tool's.
+`dgcpk` reproduces this ordering; a 0-byte file contributes **no** `DGCC`
+record at all (only a `coff`/`csize` = 0 index entry).
+
+### The writer's heuristics (all verified byte-for-byte against the tool)
+
+* **Store fallback**: the coded size (`lenA + lenB + 32`) is compared with
+  `size + 8`; if it does not pay, the block is stored (sub_425600).
+* **Pre-transform** (sub_424C30): the match extension has **no distance
+  cap** - it runs while the bytes compare equal, up to the block end.  A
+  distance-1 match chases the write position, which the decoder's forward
+  copy handles (`c_A4096.dgc`: 3 literals + one match of 4093 with
+  distance 1).
+* **LZ stage** (sub_428270): on every pre-transform block (never optional,
+  never compared with the plain stream).  The token is the BWT column of
+  the literals; `dgcpk` computes it with the suffix-array doubling
+  algorithm (exact, stable on ties, always convergent).
+* **Per-block tuning** (sub_4244E0): `r` = the fraction of the *staged
+  token's* bytes equal to their predecessor (the first byte counts when it
+  is 0); the threshold rows of FORMAT.md 4.11 select the shifts.  Column
+  sub-blocks use the second set (the coder's `this[15]` flag).
+* **Column method** (sub_423F90 / sub_424FE0): the lag means for d = 1..16,
+  best = argmin; when best > 1 the chain test (the de-interleaved column's
+  delta over every phase offset; worst*2 > best*3 sets the flag) runs and
+  the best chain mean REPLACES the plain lag mean; the flag is set by
+  best*4 < avg and cleared by 2*best >= avg.  Columns are used when the
+  flag is set - the column block is never compared with the plain one.
+* **Params bit 0**: set when the first byte of the STAGED token is 0.
 
 ---
 
@@ -222,10 +247,9 @@ The traps that cost the most time (do not repeat them):
   "compressed size" field) - comparing the two is a false oracle.
 
 Still open: nothing in the codec itself.  The remaining findings are folded into
-`FORMAT.md` (section 8 lists the fields that are not specified).  The open quality
-items are the solid writer (the ordering and grouping is now known and documented in
-section 3, but `dgcpk` does not reproduce it yet) and the LZ iteration that does not
-settle on every input.
+`FORMAT.md` (section 8 lists the fields that are not specified).  The packer
+(`dgcpk`) reproduces the tool's output byte for byte on every archive in the
+work area (see the oracle test below).
 
 
 ## 5. Build & test the unpacker
@@ -274,9 +298,26 @@ Current state of `dgcunp.c`:
 | encrypted archives (`-p` / `-k`) | working - the two keys are cracked (see `FORMAT.md` 6.6); the extracted files are byte identical to `dgcac.exe`'s |
 | the spanning files (`.dgd` / `.dgdr`) | working - the parts are found in the directory, put together, checked against the SHA-512 of the INFO chunk and written out; `-R` applies the recovery data of a `.dgdr` |
 | the packer writes the spanning files too | working - `dgcpk s` writes byte identical `.dgd` / `.dgdr` files (the plain, the encrypted and the recovery variant) |
-| the match coder (the params' bit 1) | decoded (`cm_match`) and encoded (`cm_match_put`); the packer tries it per column |
-| the LZ stage (flags bit 1) | decoded (the chain walk) and encoded (the rank iteration of FORMAT.md 4.8); the packer keeps the plain stream when the iteration does not settle |
-| the column method (tag 2) | decoded and encoded; the packer writes it when the lag test of `sub_423F90` fires, each column with the best of the literal/match coder and the LZ stage |
+| the packer writes encrypted archives | working - `dgcpk a -p`/`-k` encrypts the IARC tail (key1) and every DGCC header+payload (key1/key2), sets `IARC` flags bit 0; `dgcunp -p` extracts with matching CRCs |
+| the match coder (the params' bit 1) | decoded (`cm_match`) and encoded (`cm_match_put`); the packer uses it for the uniform columns (`spread(delta1) < 5`) |
+| the LZ stage (flags bit 1) | decoded (the chain walk) and encoded (the suffix-array doubling of the cyclic rotations - exact, stable, always convergent); on every pre-transform block, as in the tool |
+| the column method (tag 2) | decoded and encoded; the lag test is sub_423F90 verbatim (means, argmin, the chain test, the best chain mean replaces the plain mean, the 2*best override) |
+| the packer's byte compatibility | `dgcpk a` reproduces 27 reference archives (the `c_*`/`n_*`/`t*`/`m_*`/`all*`/`solid`/`each` oracles) byte for byte in every DATA/IFDT/IFNM block, and `dgcac.exe k` passes on its output |
+
+### The oracle test (the packer's regression)
+
+The scratch area (`C:\Users\Roy\AppData\Local\Temp\opencode\dgca`) holds
+reference archives next to their input files (`A4096.bin` -> `c_A4096.dgc`,
+`t4096.bin` -> `t4096.bin.dgc`, ...).  The test: pack the same input with
+`dgcpk a <new>.dgc <input>` (run from that directory, so the entry names
+match) and compare every DATA / IFDT / IFNM block byte for byte; the IARC
+creation time is the only field allowed to differ (it is the wall clock).
+For the tree archives (`m_*`, `all*`, `solid`, `each`) the tree is
+extracted with `dgcunp` first and the top-level directory is packed (the
+extraction does not restore file times, so for the non `-i` references only
+the DATA chunks compare - the IFDT embeds the original timestamps).  The
+stored references (`n_*`) are packed with `-n`, the each-file ones
+(`each`, `all`) with `-f`.
 
 The regression test: extract every archive in the work area and check that
 every file's CRC-32 matches the index:

@@ -139,7 +139,9 @@ Entry layout (64 bytes):
 
 The "compressed size" is cosmetic: in solid mode the tool apportions the
 record's size over the files by their share of the block, so the value is only
-an estimate. The last write time of a directory is its own timestamp.
+an estimate. The last write time of a directory is its own timestamp. A file
+of size 0 contributes no `DGCC` record at all (the `DATA` payload of an
+archive of only empty files is empty) - its entry carries `coff = csize = 0`.
 
 A reader that extracts sequentially (decode the whole `DATA` payload, then take
 each entry's `original size` bytes in index order) does not need `+0x28` or
@@ -180,10 +182,12 @@ assume it, only that the data stream follows the index order.
 
 ### 2.7 Identity mode
 
-With `-i` the tool zeroes the archive timestamp, the per-file timestamps and
-sets `IARC.flags` bit 1. Everything else is unchanged. Combined with `-n` this
-makes the index blob byte-for-byte deterministic, which is how the index format
-was verified.
+With `-i` the tool zeroes the archive timestamp and the per-file **creation**
+times, keeps the per-file last-write times, and sets `IARC.flags` bit 1.
+(Everything else is unchanged. Combined with `-n` this makes the index blob
+byte-for-byte deterministic for an unchanged tree, which is how the index
+format was verified. An earlier draft said `-i` zeroed the per-file
+timestamps too - the oracles show the modification time is kept.)
 
 ---
 
@@ -223,7 +227,7 @@ for a column block. The original size is `size`.
 
 | bits | meaning |
 |---|---|
-| 0 | a coder-object default the tool sets on every compressed block. The decoder loads it into the coder object but never uses it for the stream; `dgcpk` writes 0 |
+| 0 | a coder-object default the tool sets on every compressed block. The decoder loads it into the coder object but never uses it for the stream; `dgcpk` sets it too |
 | 1 | the LZ stage is present: apply the chain walk to the token buffer (section 4.8) |
 | 2 | the pre-transform is present: stream B describes the LZ77 matches (section 4.7) |
 | 16..19 | the delta order (0, 1 or 2) of a column block (section 4.9) |
@@ -233,8 +237,8 @@ clear, bits 16..19 hold its delta order, and bit 1 says whether the column's
 LZ stage is present. A block with bit 2 clear and order 0 is a plain CM-coded
 block (no pre-transform, no delta).
 
-The tool sets bit 0 on every block it writes; a writer may leave it 0 (as
-`dgcpk` does), since the stream does not depend on it.
+The tool sets bit 0 on every block it writes (it is the coder object's
+"compressed" marker, `this[4]`); `dgcpk` sets it as well.
 
 ### 3.2 The block parameters
 
@@ -242,7 +246,7 @@ The `params` word configures the entropy coder:
 
 | bits | meaning |
 |---|---|
-| 0 | the initial "previous byte" is `0xFF` when set, `0` otherwise (must match how stream A was coded). The tool sets it when the first byte of the token buffer is 0 |
+| 0 | the initial "previous byte" is `0xFF` when set, `0` otherwise (must match how stream A was coded). The tool sets it when the first byte of the **staged** token buffer is 0 (after the LZ stage, if any - see the trap in section 9) |
 | 1 | 1 = the match coder, 0 = the literal coder (section 4.5) |
 | 4..7 | `p_lit`: the shift of the literal model |
 | 8..11 | `p_pairb`: the shift of the restore pass's pair model |
@@ -252,11 +256,12 @@ The `params` word configures the entropy coder:
 | 24..27 | the pre-transform's minimum match exponent: `minmatch = 1 << value` |
 | 28..31 | the model stream's shift (`p_lzsh`) |
 
-The tool re-tunes the shifts per block from the byte statistics (sub_4244E0),
-and always writes `minmatch = 64` and `p_lzsh = 4`. The common words are
-`0x46453320` (literal coder) and `0x46453322` (match coder) for normal blocks,
-and `0x46443320` / `0x46443322` for column blocks (the column writer uses
-`p_ctx = 4`).
+The tool re-tunes the shifts per block from the staged token's byte statistics
+(sub_4244E0, called after the LZ stage in sub_425600 - see 4.11), and always
+writes `minmatch = 64` and `p_lzsh = 4`. The common words are
+`0x46453320` (literal coder, the `r > 0.6` row) and `0x46557760` (the
+default row) for normal blocks; column sub-blocks use the second tuning set
+(`0x46443320` / `0x46443322` for the very uniform columns).
 
 ### 3.3 Decoding a payload
 
@@ -543,7 +548,8 @@ v58/v57 products as in 4.4, state and ctx updated as in 4.4
 ```
 
 The tool uses it for uniform data (the `spread(delta1) < 5` case of 4.10);
-`dgcpk` tries both coders and keeps the smaller stream.
+main blocks never set it in the reference archives (the pre-transform path
+always uses the literal coder).
 
 ### 4.6 Stream A / the token buffer
 
@@ -551,6 +557,12 @@ The entropy coder's output is the token buffer (`v7` bytes): the literal coder
 produces one byte per literal plus its run, the match coder one byte per
 literal. The token buffer is what the LZ stage permutes and what the
 pre-transform's inverse consumes.
+
+Note the direction in the ENCODER (sub_425600): the pre-transform runs
+FIRST (vtable+56, producing the literals and stream B), then the LZ stage
+permutes the literals (sub_428270), then the tuning (sub_4244E0) and the
+entropy coder run on the permuted literals. The per-block byte statistics
+are therefore taken from the STAGED token, not from the raw data.
 
 ### 4.7 The pre-transform (LZ77 with an implicit distance)
 
@@ -584,8 +596,14 @@ if cand != -1 and cand < pos and data[cand] == data[pos]:
 emit data[pos] as a literal; runlen++; advance pos, updating the table
 ```
 
-The match length may reach the distance (never more), so the forward copy is
-strictly sequential and never reads a byte the decoder has not written yet.
+The match length is **not** capped by the distance (an earlier draft said it
+was - that is wrong).  The extension loop of sub_424C30 only bounds on the
+block end: it runs while `data[cand + l] == data[pos + l]`, up to
+`pos + l == size`.  A distance-1 match therefore chases the write position,
+and the decoder's forward copy (`src++` per byte) handles it - each byte it
+reads was written by the previous iteration (`c_A4096.dgc`: 3 literals and
+one match of 4093 with distance 1).  The candidate is always a previous
+position (`tbl[key]` is written only after the read), so `cand < pos`.
 At the end the remaining literal run is emitted (even when it is 0), so stream
 B always ends with a literal-run symbol.
 
@@ -645,14 +663,19 @@ token[a[k]] = data[k]
 start = rank[0]
 ```
 
-The binary implements the same fixed point with a radix sort by the following
-context and a cycle merge; the iteration above is the definition that merge
-computes. It reproduces the original's token buffer byte for byte (the
-`text.txt` block of `all.dgc` has `start = 50856` and stream A = 19649 bytes).
+The binary computes the same ranks with an LSD radix sort over the 2-byte
+context plus a cycle merge; the token is the BWT column of the literal
+buffer and `start` is its primary index.  `dgcpk` reproduces it with the
+suffix-array **doubling** algorithm on the cyclic rotations (exact, stable
+on ties - equal rotations order by position, which puts rotation 0 first
+among its ties and fixes `start` - and always convergent, O(n log^2 n)).
 
-The iteration does not settle on every input (for example the delta-transformed
-columns of a 16-bit matrix). A writer must then keep the plain stream (no LZ
-stage); the tool's cycle merge always finds a fixed point.
+The LZ stage is **not** optional and is never weighed against the plain
+stream: every pre-transform block of the tool carries flags bit 1 (the
+`v22` may be 0 when the permutation is the identity, e.g. the 3-byte token
+`AAA` of `c_A4096.dgc`).  A writer that cannot compute the fixed point may
+omit the stage (bit 1 clear, plain stream) - the decoder accepts both - but
+that output is not byte-compatible with the tool.
 
 ### 4.9 The delta transform (column blocks)
 
@@ -695,26 +718,41 @@ columns have different lengths (the tool writes e.g. stride 12 for a 131072
 byte block: eight columns of 10923 bytes and four of 10922). A decoder must use
 each column's own length, not `total / stride`.
 
-The writer's heuristics (informative, from sub_423F90 and sub_424FE0):
+The writer's heuristics (verified against sub_423F90 and sub_424FE0; the
+packer reproduces all of them byte for byte):
 
-* **stride**: compute the mean `|data[i] - data[i-d]|` for every lag
-  `d = 1..16`; the best lag is the stride, and the columns are used when
-  `best * 4 < average of the 16 lags` (only for blocks of at least 0x400
-  bytes; there is a secondary test in the lag > 1 branch).
+* **the lag test** (sub_423F90, blocks of at least 0x400 bytes): the mean
+  `|data[i] - data[i-d]|` for every lag `d = 1..16`; `best` = the argmin
+  lag, `avg` = the mean of the 16 means.  When `best > 1` the **chain
+  test** runs first: for every phase offset `s` in `[best, 2*best)` the
+  mean of the chain `|data[s+k*best] - data[s+(k-1)*best]|` is computed,
+  and `worst*2 > best*3` sets the column flag.  The best chain mean then
+  **replaces** the plain lag mean, and the flag is set by `best*4 < avg`
+  and cleared again by `2*best >= avg`.  (pcm16.bin of the `all.dgc`
+  oracle: the plain mean 38.2 fails both tests, the best chain mean 4.7
+  passes both - the replacement is what makes the columns fire.)
+* **stride**: the argmin lag (1..16).  The columns are used when the flag
+  is set - the column block is **never** compared with the plain block
+  (repeat.txt: the tool writes 3 columns of 128 bytes where a plain block
+  would have been 56).
 * **delta order** of every column, from the "spread" of its byte histogram:
   `spread(x) = sqrt(sum_v (cnt_v*256/n - 1)^2 / 255)`;
   order 0 if `spread(col) * 1.2 > spread(delta1)`;
   else 1, and 2 when `spread(delta2) > 1.1 * spread(delta1)` and
   `spread(delta2) * spread(col) * 1.8 > spread(delta1)^2`.
-* **LZ stage**: off for order 2 and when `spread(delta1) < 1`.
+* **LZ stage**: on for order 0 and 1 when `spread(delta1) >= 1`, off for
+  order 2 and when `spread(delta1) < 1`.
 * **match coder**: on when `spread(delta1) < 5` (the uniform PCM columns).
-* the tool does not compare the column block with the plain block; `dgcpk`
-  builds both and keeps the smaller.
+* **store fallback**: applies to the column block as well - the coded size
+  (`lenA + lenB + 32` of the whole record) is compared with `size + 8`.
 
 ### 4.11 Block parameters the tool writes
 
-The tool re-tunes the shifts per block with sub_4244E0 from the "same byte"
-ratio `r` (the fraction of bytes equal to their predecessor). The compressor
+The tool re-tunes the shifts per block with sub_4244E0 **after the LZ
+stage**, from the "same byte" ratio `r` of the STAGED TOKEN buffer (the
+first byte counts when it is 0 - the binary's comparison byte starts at 0).
+This is why a text block whose raw bytes almost never repeat still gets the
+`r > 0.6` row: the BWT clusters the bytes into runs.  The compressor
 object's constructor starts at `p_lit 2, p_pairb 4, p_pair 3, p_ctx 6,
 p_run 4`, and the tuning overrides them in this order:
 
@@ -727,8 +765,8 @@ r > 0.4:            p_lit 2, p_pairb 4, p_pair 4, p_run 4
 r > 0.6:            p_lit 2, p_pairb 3, p_pair 3, p_run 4
 ```
 
-When the coder's `this[15]` flag is set, a second set applies: `p_run 4` and
-`p_ctx 5`, then
+When the coder's `this[15]` flag is set - the **column sub-blocks** - a
+second set applies: `p_run 4` and `p_ctx 5`, then
 
 ```
 r > 0.05:           p_lit 4, p_pairb 5, p_pair 5, p_ctx 5, p_run 4
@@ -1105,6 +1143,13 @@ The specification was validated against the tool:
   encoder in `dgcpk.c` reproduces the original's streams (e.g. the `text.txt`
   block: `start = 50856`, stream A = 19649 bytes; the uniform PCM columns with
   the match coder; the column method with the delta orders).
+* **Packer**: `dgcpk a` reproduces 27 reference archives of the work area
+  byte for byte in every DATA / IFDT / IFNM block - the stored twins
+  (`n_*`), the compressed ones (`c_*`, `t*`), the solid / each-file trees
+  (`solid`, `each`, `all`, `all_solid`, `m_*`), empty files, the uniform
+  runs and the column-friendly data. The only field that differs is the
+  IARC archive-creation time (the wall clock). `dgcac k` passes on the
+  packer's archives, and `dgcac e` extracts them byte identically.
 * **Extraction**: every archive in the work area (including `names.dgc` with
   5981 entries and compressed index and names) is extracted by `dgcunp.c` and
   every file's CRC-32 matches the index. The tool (`dgcac e`) extracts the
