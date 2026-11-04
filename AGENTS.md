@@ -299,6 +299,7 @@ Current state of `dgcunp.c`:
 | the spanning files (`.dgd` / `.dgdr`) | working - the parts are found in the directory, put together, checked against the SHA-512 of the INFO chunk and written out; `-R` applies the recovery data of a `.dgdr` |
 | the packer writes the spanning files too | working - `dgcpk s` writes byte identical `.dgd` / `.dgdr` files (the plain, the encrypted and the recovery variant) |
 | the packer writes encrypted archives | working - `dgcpk a -p`/`-k` encrypts the IARC tail (key1) and every DGCC header+payload (key1/key2), sets `IARC` flags bit 0; `dgcunp -p` extracts with matching CRCs |
+| the packer's recovery data | working - `dgcpk a -r1..-r9` writes byte-identical DGCR chunks (`-i` archives match `dgcac -i -r<n>` byte for byte); a 3-word-damaged archive is repaired by `dgcunp -R` and extracts without errors |
 | the match coder (the params' bit 1) | decoded (`cm_match`) and encoded (`cm_match_put`); the packer uses it for the uniform columns (`spread(delta1) < 5`) |
 | the LZ stage (flags bit 1) | decoded (the chain walk) and encoded (the suffix-array doubling of the cyclic rotations - exact, stable, always convergent); on every pre-transform block, as in the tool |
 | the column method (tag 2) | decoded and encoded; the lag test is sub_423F90 verbatim (means, argmin, the chain test, the best chain mean replaces the plain mean, the 2*best override) |
